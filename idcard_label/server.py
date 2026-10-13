@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from . import __version__
 from .model_refresh import LocalModelRefresher, ModelRefreshError
 from .store import ConflictError, ReviewStore
 
@@ -81,6 +82,7 @@ class ReviewServer(ThreadingHTTPServer):
         )
         config["export_root"] = self.directory_preferences.get("export_root")
         config["export_format"] = self.directory_preferences.get("export_format", "yolo_pose")
+        config["app_version"] = __version__
         return config
 
     def set_model_directory(self, model_directory):
@@ -244,7 +246,7 @@ def _validate_workspace_directories(input_root, output_root):
 
 
 class ReviewHandler(BaseHTTPRequestHandler):
-    server_version = "IDCardReview/1.0"
+    server_version = "IDCardReview/%s" % __version__
 
     def do_GET(self):
         parsed = urlparse(self.path)

@@ -32,7 +32,7 @@ const DECISION_BUTTON_IDS = [
 ];
 
 const elements = Object.fromEntries([
-  "progressText", "modelSelect", "statusFilter", "classFilter", "archiveBatchFilter",
+  "appVersion", "progressText", "modelSelect", "statusFilter", "classFilter", "archiveBatchFilter",
   "queue", "previousPage", "nextPage", "pageText", "itemProgress", "modelRefreshButton", "undoButton", "previousItem", "nextItem", "fileName",
   "imageMeta", "canvasStage", "reviewCanvas", "canvasEditor", "canvasSelectionCount", "canvasClassSwatch", "canvasClassEditor",
   "canvasDeleteTarget", "emptyState", "rejectButton", "reviewButton", "reviewedButton", "saveButton",
@@ -85,6 +85,7 @@ async function request(url, options = {}) {
 async function initialize() {
   try {
     state.config = await request("/api/config");
+    elements.appVersion.textContent = `v${state.config.app_version}`;
     renderModelOptions(state.config.model_refresh);
     bindEvents();
     if (!state.config.configured) {

@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "idcard-label"
+dynamic = ["version"]
+description = "Local tooling to review and correct ID-card pose annotations."
+readme = "README.MD"
+requires-python = ">=3.8"
+license = {file = "LICENSE"}
+authors = [
+  {name = "DigInsight AI", email = "reid.li@foxmail.com"},
+]
+
+[project.optional-dependencies]
+model = [
+  "numpy>=1.23,<3",
+  "opencv-python>=4.8,<5",
+  "ultralytics>=8.3,<9",
+]
+
+[project.scripts]
+idcard-label = "idcard_label.cli:main"
+
+[tool.setuptools]
+packages = ["idcard_label"]
+
+[tool.setuptools.dynamic]
+version = {attr = "idcard_label.__version__"}
+
+[tool.setuptools.package-data]
+idcard_label = ["static/*"]

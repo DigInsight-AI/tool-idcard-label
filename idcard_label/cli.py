@@ -1,12 +1,18 @@
 import argparse
 import webbrowser
 
+from . import __version__
 from .server import ReviewServer
 from .store import ReviewStore
 
 
 def build_parser():
     parser = argparse.ArgumentParser(description="Create, review, and correct ID-card pose annotations.")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version="%(prog)s " + __version__,
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     serve = subparsers.add_parser("serve", help="Start the local review web app.")

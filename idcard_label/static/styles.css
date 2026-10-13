@@ -25,6 +25,7 @@ button { cursor: pointer; }
 .brand { flex: 0 0 auto; display: flex; align-items: baseline; gap: 14px; min-width: 0; }
 .brand strong { font-size: 16px; }
 .brand span { display: none; }
+.brand .app-version { display: inline; color: #aeb8b1; font-size: 11px; font-variant-numeric: tabular-nums; }
 .top-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 6px; min-width: 0; }
 .top-actions .button { padding-inline: 9px; white-space: nowrap; }
 .contact-links { margin-left: auto; display: flex; align-items: center; gap: 14px; min-width: 0; color: #c9d0cb; font-size: 12px; font-style: normal; white-space: nowrap; }

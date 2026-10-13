@@ -4,10 +4,13 @@ import struct
 import tempfile
 import threading
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from idcard_label import __version__
 from idcard_label.cli import build_parser
 from idcard_label.formats import image_dimensions
 from idcard_label.geometry import KEYPOINT_SEMANTICS
@@ -673,6 +676,15 @@ class LabelToolTest(unittest.TestCase):
         commands = next(action for action in parser._actions if getattr(action, "choices", None))
         self.assertEqual(set(commands.choices), {"serve"})
 
+    def test_label_cli_reports_the_release_version(self):
+        parser = build_parser()
+        output = StringIO()
+        with self.assertRaises(SystemExit) as exit_context, redirect_stdout(output):
+            parser.parse_args(["--version"])
+        self.assertEqual(exit_context.exception.code, 0)
+        self.assertEqual(output.getvalue().strip(), "%s 1.0.0" % parser.prog)
+        self.assertEqual(__version__, "1.0.0")
+
     def test_workspace_directories_accept_an_empty_input_directory(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -690,6 +702,7 @@ class LabelToolTest(unittest.TestCase):
                 self.assertEqual(config["input_root"], "data/idcard")
                 self.assertEqual(config["output_root"], "data/workspace")
                 self.assertEqual(config["model_directory"], "data/model")
+                self.assertEqual(config["app_version"], __version__)
             finally:
                 server.server_close()
 

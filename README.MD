@@ -1,5 +1,7 @@
 # ID Card Label Tool
 
+Current release: **v1.0.0**
+
 Local tooling to review and correct ID-card detection boxes and four semantic
 Pose keypoints.
 Input images are read-only. A workspace stores only

@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>ID Card Data Review</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <strong>Dataset Review</strong>
+      <span id="progressText">Loading...</span>
+    </div>
+    <div class="top-actions">
+      <select id="modelSelect" class="model-select" aria-label="Local refresh model" title="Local model used by Refresh (F)"></select>
+      <select id="batchSelect" class="batch-select" aria-label="Active review batch" hidden></select>
+      <button id="newBatchButton" class="icon-button top-icon" title="Start a new review batch" aria-label="Start a new review batch" hidden>+</button>
+      <button id="archiveManagerButton" class="button secondary" title="Review or merge archived batches">Archives</button>
+      <button id="settingsButton" class="icon-button top-icon" title="Review settings" aria-label="Review settings">&#9881;</button>
+    </div>
+    <address class="contact-links" aria-label="Contact information">
+      <span>QQ: 3873199257</span>
+      <a href="mailto:reid.li@foxmail.com">reid.li@foxmail.com</a>
+    </address>
+  </header>
+
+  <main class="workspace">
+    <aside class="queue-panel">
+      <div class="filters">
+        <select id="statusFilter" aria-label="Review status">
+          <option value="pending">To inspect</option>
+          <option value="candidate">Candidates</option>
+          <option value="archive">Archives</option>
+          <option value="rejected">Rejected</option>
+        </select>
+        <select id="classFilter" aria-label="Class filter"><option value="all">All classes</option></select>
+        <select id="archiveBatchFilter" aria-label="Archive batch filter" hidden></select>
+        <button id="archiveAllCandidatesButton" type="button" class="button secondary filter-action" hidden>Archive all candidates</button>
+      </div>
+      <div id="queue" class="queue" aria-label="Review queue"></div>
+      <div class="pager">
+        <button id="previousPage" class="icon-button" title="Previous page" aria-label="Previous page">&#8592;</button>
+        <span id="pageText">1 / 1</span>
+        <button id="nextPage" class="icon-button" title="Next page" aria-label="Next page">&#8594;</button>
+      </div>
+    </aside>
+
+    <section class="review-panel">
+      <div class="image-header">
+        <div>
+          <strong id="fileName">Select an image</strong>
+          <span id="imageMeta"></span>
+        </div>
+        <div class="image-nav">
+          <button id="modelRefreshButton" class="icon-button" title="Refresh targets with the selected local model (F)" aria-label="Refresh targets with the selected local model">&#8635;</button>
+          <button id="undoButton" class="icon-button" title="Undo annotation edit (Ctrl/Command + Z)" aria-label="Undo annotation edit">&#8630;</button>
+          <button id="previousItem" class="icon-button" title="Previous image (Left arrow)" aria-label="Previous image">&#8592;</button>
+          <button id="nextItem" class="icon-button" title="Next image (Right arrow)" aria-label="Next image">&#8594;</button>
+        </div>
+      </div>
+      <div id="canvasStage" class="canvas-stage">
+        <canvas id="reviewCanvas"></canvas>
+        <div id="canvasEditor" class="canvas-editor" hidden>
+          <span id="canvasSelectionCount" class="selection-count"></span>
+          <span id="canvasClassSwatch" class="class-swatch"></span>
+          <select id="canvasClassEditor" aria-label="Edit selected target class"></select>
+          <button id="canvasDeleteTarget" class="canvas-delete" title="Delete selected targets (X)" aria-label="Delete selected targets">×</button>
+        </div>
+        <div id="emptyState" class="empty-state">Choose an item from the queue</div>
+      </div>
+      <div class="decision-bar">
+        <span id="itemProgress" class="review-progress" aria-live="polite">0 / 0</span>
+        <button id="rejectButton" class="button danger" hidden>Reject <kbd>R</kbd></button>
+        <button id="reviewButton" class="button warning" hidden>Needs review <kbd>Q</kbd></button>
+        <button id="reviewedButton" class="button secondary" hidden>Approve review <kbd>E</kbd></button>
+        <button id="saveButton" class="button primary" hidden>Add candidate <kbd>G</kbd></button>
+        <button id="acceptButton" class="button secondary" hidden>Approve for archive <kbd>A</kbd></button>
+      </div>
+    </section>
+
+    <aside class="detail-panel">
+      <div class="section-title">
+        <strong id="targetTitle">Targets</strong>
+        <button id="addTargetButton" class="icon-button" title="Add target (N)" aria-label="Add target">+</button>
+      </div>
+      <div id="targetList" class="target-list"></div>
+      <label class="note-field">
+        Review note
+        <textarea id="reviewNote" rows="4" placeholder="Ambiguity, correction reason, or follow-up"></textarea>
+      </label>
+      <button id="saveReviewButton" class="button secondary save-review" title="Save annotation edits, status, and review note (Ctrl/Command + S)">Save review</button>
+      <div class="status-box">
+        <span>Current status</span>
+        <strong id="currentStatus">-</strong>
+      </div>
+    </aside>
+  </main>
+  <dialog id="settingsDialog" class="settings-dialog" aria-labelledby="settingsDialogTitle">
+    <form id="settingsForm" method="dialog">
+      <div class="dialog-head">
+        <div>
+          <span class="dialog-kicker">Workspace</span>
+          <strong id="settingsDialogTitle">Settings</strong>
+          <span>Choose review directories and the local model directory.</span>
+        </div>
+        <button id="settingsCancelButton" type="button" class="icon-button dialog-close" aria-label="Close settings">×</button>
+      </div>
+      <div class="directory-grid">
+        <label>
+          Input directory
+          <input id="inputRootPath" type="text" required spellcheck="false" placeholder="/path/to/input">
+          <small>Reads image files from this directory. Images are loaded only when they enter the review queue.</small>
+        </label>
+        <label>
+          Output directory
+          <input id="outputRootPath" type="text" required spellcheck="false" placeholder="/path/to/review-output">
+          <small>An empty directory is valid. It stores review.sqlite3, candidates/, and archives/; switching inputs reuses it.</small>
+        </label>
+        <label>
+          Model directory
+          <input id="modelDirectoryPath" type="text" spellcheck="false" placeholder="/path/to/models">
+          <small>Contains local .pt or .pth files used by Refresh. This setting is optional and remembered locally.</small>
+        </label>
+      </div>
+      <div class="dialog-actions">
+        <button id="settingsCloseButton" type="button" class="button secondary">Cancel</button>
+        <button type="submit" class="button primary">Apply settings</button>
+      </div>
+    </form>
+  </dialog>
+  <dialog id="archiveDialog" class="settings-dialog archive-dialog" aria-labelledby="archiveDialogTitle">
+    <form id="archiveMergeForm" method="dialog">
+      <div class="dialog-head">
+        <div>
+          <span class="dialog-kicker">Data management</span>
+          <strong id="archiveDialogTitle">Archives</strong>
+          <span>Select one to review or multiple archives to merge.</span>
+        </div>
+        <button id="archiveDialogClose" type="button" class="icon-button dialog-close" aria-label="Close archives">×</button>
+      </div>
+      <div class="archive-content">
+        <div id="archiveBatchList" class="archive-batch-list"></div>
+        <div class="archive-destination">
+          <span class="archive-destination-label">Merge into</span>
+          <div class="archive-destination-modes">
+            <label><input type="radio" name="archiveDestinationMode" value="new" checked> New folder</label>
+            <label><input type="radio" name="archiveDestinationMode" value="existing"> Existing archive</label>
+          </div>
+          <label id="mergedFolderNameField" class="archive-destination-field">
+            <span>Folder name</span>
+            <input id="mergedFolderName" type="text" required spellcheck="false">
+          </label>
+          <label id="mergeDestinationArchiveField" class="archive-destination-field" hidden>
+            <span>Destination archive</span>
+            <select id="mergeDestinationArchive"></select>
+            <small>The selected archives will be merged into this folder, including its existing contents.</small>
+          </label>
+        </div>
+      </div>
+      <div class="dialog-actions">
+        <span id="archiveSelectionSummary" class="dialog-summary"></span>
+        <button id="selectAllArchives" type="button" class="button secondary">Select all</button>
+        <button id="reviewSelectedArchive" type="button" class="button secondary">Review archive</button>
+        <button id="exportSelectedArchive" type="button" class="button secondary">Export archive</button>
+        <button id="mergeArchivesButton" type="submit" class="button primary">Merge archives</button>
+      </div>
+    </form>
+  </dialog>
+  <dialog id="archiveAllCandidatesDialog" class="settings-dialog notice-dialog" aria-labelledby="archiveAllCandidatesTitle">
+    <form id="archiveAllCandidatesForm" method="dialog">
+      <div class="dialog-head">
+        <div>
+          <span class="dialog-kicker">Bulk action</span>
+          <strong id="archiveAllCandidatesTitle">Archive all candidates</strong>
+          <span id="archiveAllCandidatesSummary"></span>
+        </div>
+        <button id="archiveAllCandidatesClose" type="button" class="icon-button dialog-close" aria-label="Close archive all candidates">×</button>
+      </div>
+      <div class="directory-grid">
+        <label>
+          Archive destination (optional)
+          <select id="candidateArchiveBatchSelect"></select>
+          <small>Select a historical archive to merge into, or create a new archive.</small>
+        </label>
+        <label id="newCandidateArchiveBatchField" hidden>
+          New folder name
+          <input id="newCandidateArchiveBatchName" type="text" maxlength="120" spellcheck="false">
+        </label>
+        <label id="bulkConfirmPoseField" class="check-field" hidden>
+          <span><input id="bulkConfirmPose" type="checkbox" checked> Confirm canonical K0-K3 semantics for all candidates</span>
+          <small>This marks K0, K1, K2, and K3 as physical top-left, top-right, bottom-right, and bottom-left. Geometry is still validated.</small>
+        </label>
+      </div>
+      <div class="dialog-actions">
+        <button id="archiveAllCandidatesCancel" type="button" class="button secondary">Cancel</button>
+        <button id="archiveAllCandidatesSubmit" type="submit" class="button primary">Archive all</button>
+      </div>
+    </form>
+  </dialog>
+  <dialog id="endOfQueueDialog" class="settings-dialog notice-dialog completion-dialog" aria-labelledby="endOfQueueTitle">
+    <form method="dialog">
+      <div class="completion-content">
+        <span class="completion-mark" aria-hidden="true">&#10003;</span>
+        <div>
+          <strong id="endOfQueueTitle">Review queue complete</strong>
+          <span>There are no more images in the current review queue.</span>
+        </div>
+      </div>
+      <div class="dialog-actions">
+        <button id="endOfQueueClose" type="submit" class="button primary">Done</button>
+      </div>
+    </form>
+  </dialog>
+  <dialog id="actionDialog" class="settings-dialog action-dialog" aria-labelledby="actionDialogTitle">
+    <form id="actionDialogForm" method="dialog">
+      <div class="dialog-head">
+        <div>
+          <span id="actionDialogKicker" class="dialog-kicker">Action required</span>
+          <strong id="actionDialogTitle"></strong>
+          <span id="actionDialogDescription"></span>
+        </div>
+        <button id="actionDialogClose" type="button" class="icon-button dialog-close" aria-label="Close dialog">×</button>
+      </div>
+      <div class="action-dialog-content">
+        <label id="actionDialogSelectField" hidden>
+          <span id="actionDialogSelectLabel"></span>
+          <select id="actionDialogSelect"></select>
+          <small id="actionDialogSelectHint"></small>
+        </label>
+        <label id="actionDialogField">
+          <span id="actionDialogLabel"></span>
+          <input id="actionDialogInput" type="text" autocomplete="off" spellcheck="false">
+          <small id="actionDialogHint"></small>
+        </label>
+        <div id="actionDialogNotice" class="dialog-notice" hidden></div>
+      </div>
+      <div class="dialog-actions">
+        <button id="actionDialogCancel" type="button" class="button secondary">Cancel</button>
+        <button id="actionDialogSubmit" type="submit" class="button primary">Continue</button>
+      </div>
+    </form>
+  </dialog>
+  <div id="toast" class="toast" role="status"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

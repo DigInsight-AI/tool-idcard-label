@@ -5,12 +5,12 @@ Current release: **v1.0.0**
 Local tooling to review and correct ID-card detection boxes and four semantic
 Pose keypoints.
 Input images are read-only. A workspace stores only
-candidate data and immutable archives, plus its local MD5 index. You can switch
+candidate data and editable archives, plus its local MD5 index. You can switch
 input directories and the workspace excludes images already present in either
 candidate or archive data, or previously rejected, by their image-content MD5.
 
 It combines **local model predictions, manual correction, quality review,
-immutable archives, and training dataset export** in one browser-based
+editable archives, and training dataset export** in one browser-based
 workspace.
 
 ## Product Overview
@@ -23,7 +23,7 @@ workspace.
 | Visual correction | Drag corners, add or remove targets, edit classes, set visibility, and undo changes | Handles rotated, occluded, and multi-card images efficiently |
 | Semantic keypoints | Enforces `K0..K3` as top-left, top-right, bottom-right, and bottom-left | Keeps Pose labels consistent |
 | Quality gates | Separates pending, needs-review, candidate, rejected, and archived states | Prevents incomplete labels from entering training data |
-| Traceable archives | Preserves immutable snapshots and stores later edits as correction revisions | Supports audit and dataset versioning |
+| Correctable archives | Applies reviewed archive edits immediately and tracks the edit count | Prevents known bad labels from remaining in training data |
 | Dataset export | Produces YOLO Pose or COCO Keypoints data with train/validation splits | Moves approved data directly into training |
 
 ```mermaid
@@ -33,7 +33,7 @@ flowchart LR
     C --> D{Review}
     D -->|Pass| E[Candidates]
     D -->|Invalid| F[Reject by MD5]
-    E --> G[Immutable archive]
+    E --> G[Correctable archive]
     G --> H[YOLO Pose]
     G --> I[COCO Keypoints]
 ```
@@ -80,7 +80,7 @@ read directly from the current input directory on demand; they are not stored as
 workspace output. Use `R` to reject an image permanently; matching image content
 will not return to the queue. Confirm `K0..K3` as top-left, top-right, bottom-right, and
 bottom-left in the upright card orientation, then archive candidates.
-Each archive is immutable and contains labels, records, source-image links, and
+Each archive contains labels, records, source-image links, and
 the class map. The Archives dialog exports one selected archive group as either
 a ready-to-train YOLO Pose dataset with `data.yaml`, `images/train|val`, and
 `labels/train|val`, or a COCO Keypoints dataset with split images and
@@ -89,9 +89,10 @@ records are included.
 Exporting the same archive to the same directory again safely replaces the
 previous dataset so archive additions and corrections are reflected.
 The archive review list is synchronized from each `annotations.jsonl` manifest.
-Editing or rejecting an archived record creates a separate correction revision;
-the immutable archive snapshot remains indexed and reviewable while that
-revision is pending.
+Editing, rejecting, or marking an archived record for follow-up atomically
+updates the archive manifest, record, label, report, and local index before the
+save request completes. Non-accepted records are immediately excluded from
+training dataset exports.
 The most recently used export directory is remembered locally.
 
 Model-assisted refresh is optional. Install `requirements.txt` only when using a

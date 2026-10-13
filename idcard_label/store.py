@@ -3,6 +3,7 @@ import os
 import shutil
 import sqlite3
 import tempfile
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -16,7 +17,6 @@ from .formats import (
 from .geometry import (
     KEYPOINT_NAMES,
     KEYPOINT_SEMANTICS,
-    UNCONFIRMED_KEYPOINT_SEMANTICS,
     bbox_from_keypoints,
     signed_area,
     validate_keypoints,
@@ -98,10 +98,12 @@ class ReviewStore:
         self.database_path = self.workspace / "review.sqlite3"
         self.connection = sqlite3.connect(str(self.database_path), check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
+        self._archive_update_lock = threading.RLock()
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA journal_mode = WAL")
         self._create_schema()
         self.sync_archive_index()
+        self._remove_pose_confirmation_gate()
         self._ensure_active_review_batch()
         if self.meta("input_root"):
             self.sync_candidates()
@@ -170,6 +172,7 @@ class ReviewStore:
                 updated_at TEXT NOT NULL,
                 pose_ready INTEGER NOT NULL DEFAULT 0,
                 pose_error TEXT NOT NULL DEFAULT '',
+                version INTEGER NOT NULL DEFAULT 1,
                 UNIQUE(archive_batch, archive_key)
             );
             CREATE TABLE IF NOT EXISTS archive_annotations (
@@ -289,6 +292,53 @@ class ReviewStore:
                 "ALTER TABLE annotations ADD COLUMN keypoint_semantics "
                 "TEXT NOT NULL DEFAULT 'legacy_polygon_v0'"
             )
+
+        archive_item_columns = {
+            row["name"] for row in self.connection.execute("PRAGMA table_info(archive_items)")
+        }
+        if "version" not in archive_item_columns:
+            self.connection.execute(
+                "ALTER TABLE archive_items ADD COLUMN version INTEGER NOT NULL DEFAULT 1"
+            )
+
+    def _remove_pose_confirmation_gate(self):
+        if self.meta("pose_confirmation_removed") == "1":
+            return
+        with self.connection:
+            self.connection.execute(
+                "UPDATE annotations SET keypoint_semantics=?",
+                (KEYPOINT_SEMANTICS,),
+            )
+            self.connection.execute(
+                "UPDATE archive_annotations SET keypoint_semantics=?",
+                (KEYPOINT_SEMANTICS,),
+            )
+            for table, annotation_table, foreign_key in (
+                ("items", "annotations", "item_id"),
+                ("archive_items", "archive_annotations", "archive_item_id"),
+            ):
+                rows = self.connection.execute(
+                    "SELECT id,width,height,status FROM %s" % table
+                ).fetchall()
+                for row in rows:
+                    annotations = [
+                        self._annotation(value)
+                        for value in self.connection.execute(
+                            "SELECT * FROM %s WHERE %s=? ORDER BY id"
+                            % (annotation_table, foreign_key),
+                            (row["id"],),
+                        )
+                    ]
+                    pose_ready, pose_error = self._pose_readiness(annotations, row)
+                    self.connection.execute(
+                        "UPDATE %s SET pose_ready=?,pose_error=? WHERE id=?" % table,
+                        (
+                            1 if pose_ready else 0,
+                            "" if pose_ready or row["status"] != "accepted" else pose_error,
+                            row["id"],
+                        ),
+                    )
+            self.set_meta("pose_confirmation_removed", "1")
 
     def initialize(self, input_root, limit=None):
         input_root = Path(input_root).expanduser().resolve()
@@ -573,21 +623,22 @@ class ReviewStore:
                 review = record.get("review") or {}
                 status = review.get("status") or "accepted"
                 detections = record.get("detections") or []
-                pose_ready = bool(detections) and all(
-                    detection.get("keypoint_semantics") == KEYPOINT_SEMANTICS
-                    for detection in detections
-                )
+                dimensions = {
+                    "width": int(record.get("width") or 0),
+                    "height": int(record.get("height") or 0),
+                }
+                pose_ready, pose_error = self._pose_readiness(detections, dimensions)
                 cursor = self.connection.execute(
                     "INSERT INTO archive_items(archive_batch,archive_key,image_path,image_md5,width,height,"
-                    "status,reviewed,archived_at,review_batch,note,updated_at,pose_ready,pose_error) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "status,reviewed,archived_at,review_batch,note,updated_at,pose_ready,pose_error,version) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         archive_batch,
                         archive_key,
                         str(image_path),
                         image_md5,
-                        int(record.get("width") or 0),
-                        int(record.get("height") or 0),
+                        dimensions["width"],
+                        dimensions["height"],
                         status,
                         1 if review.get("reviewed", True) else 0,
                         report.get("archived_at"),
@@ -595,7 +646,8 @@ class ReviewStore:
                         str(review.get("note") or ""),
                         review.get("updated_at") or report.get("archived_at") or _now(),
                         1 if pose_ready else 0,
-                        "" if pose_ready or status != "accepted" else "archive label is not pose-ready",
+                        "" if pose_ready or status != "accepted" else pose_error,
+                        max(1, int(review.get("version") or 1)),
                     ),
                 )
                 archive_item_id = cursor.lastrowid
@@ -615,7 +667,7 @@ class ReviewStore:
                                 detection.get("keypoint_visibility") or [2, 2, 2, 2],
                                 separators=(",", ":"),
                             ),
-                            detection.get("keypoint_semantics") or UNCONFIRMED_KEYPOINT_SEMANTICS,
+                            KEYPOINT_SEMANTICS,
                         ),
                     )
 
@@ -714,7 +766,7 @@ class ReviewStore:
                 decision = (record.get("review") or {}).get("status") or "accepted"
                 if decision == "accepted":
                     records[image_md5] = (record, image_source)
-                elif decision in ("rejected", "ignored"):
+                elif decision in ("rejected", "ignored", "needs_review", "pending"):
                     records.pop(image_md5, None)
                 else:
                     raise ValueError("archive record has unsupported review status %s" % decision)
@@ -911,7 +963,7 @@ class ReviewStore:
                             if label_content:
                                 label_content += "\n"
                         _atomic_write_text(labels_path / (image_md5 + ".txt"), label_content)
-                    elif decision in ("rejected", "ignored"):
+                    elif decision in ("rejected", "ignored", "needs_review", "pending"):
                         excluded += 1
                     else:
                         raise ValueError("archive record has unsupported review status %s" % decision)
@@ -1005,7 +1057,7 @@ class ReviewStore:
             "excluded": excluded,
         }
 
-    def archive_all_candidates(self, review_batch=None, confirm_pose_semantics=False, merge_into_archive=None):
+    def archive_all_candidates(self, review_batch=None, merge_into_archive=None):
         merge_into_archive = str(merge_into_archive or "").strip().strip("/")
         if merge_into_archive:
             available = {entry["archive_batch"]: entry for entry in self.list_archive_batches()}
@@ -1020,7 +1072,6 @@ class ReviewStore:
         archived = self.archive_saved(
             review_batch,
             all_candidates=True,
-            confirm_pose_semantics=confirm_pose_semantics,
         )
         if not merge_into_archive:
             return archived
@@ -1129,19 +1180,9 @@ class ReviewStore:
         counts["candidates"] = self.connection.execute(
             "SELECT COUNT(*) AS count FROM items WHERE status='accepted' AND archived=0"
         ).fetchone()["count"]
-        counts["candidate_pose_unconfirmed"] = self.connection.execute(
-            "SELECT COUNT(DISTINCT i.id) AS count FROM items i "
-            "JOIN annotations a ON a.item_id=i.id "
-            "WHERE i.status='accepted' AND i.archived=0 AND a.keypoint_semantics<>?",
-            (KEYPOINT_SEMANTICS,),
-        ).fetchone()["count"]
         counts["ready_to_archive"] = self.connection.execute(
             "SELECT COUNT(*) AS count FROM items WHERE status='accepted' AND reviewed=1 "
             "AND archived=0 AND pose_ready=1"
-        ).fetchone()["count"]
-        counts["pose_unconfirmed"] = self.connection.execute(
-            "SELECT COUNT(*) AS count FROM items WHERE status='accepted' AND reviewed=1 "
-            "AND archived=0 AND pose_ready=0"
         ).fetchone()["count"]
         counts["unreviewed"] = counts["total"] - counts["reviewed"]
         return counts
@@ -1279,7 +1320,7 @@ class ReviewStore:
     def update_item(self, item_id, payload):
         item_id = int(item_id)
         if item_id < 0:
-            item_id, payload = self._prepare_archive_correction(item_id, payload)
+            return self._update_archive_item(item_id, payload)
         status = payload.get("status")
         if status not in VALID_STATUSES:
             raise ValueError("invalid review status")
@@ -1369,6 +1410,217 @@ class ReviewStore:
         # session; initialize() replaces them when the input root changes and
         # close() discards them when the session ends.
         return updated
+
+    def _update_archive_item(self, item_id, payload):
+        with self._archive_update_lock:
+            return self._update_archive_item_locked(item_id, payload)
+
+    def _update_archive_item_locked(self, item_id, payload):
+        snapshot = self.get_item(item_id)
+        if not snapshot:
+            return None
+        if int(payload.get("version") or 0) != snapshot["version"]:
+            raise ConflictError("archive item changed in another session")
+        status = payload.get("status")
+        if status not in VALID_STATUSES:
+            raise ValueError("invalid review status")
+        annotations = payload.get("annotations")
+        if not isinstance(annotations, list):
+            raise ValueError("annotations must be a list")
+        normalized = [self._normalize_annotation(value, snapshot) for value in annotations]
+        if status == "accepted" and not normalized:
+            raise ValueError("at least one target is required for an accepted archive item")
+        pose_ready, pose_error = self._pose_readiness(normalized, snapshot)
+        if status == "accepted" and not pose_ready:
+            raise ValueError("accepted archive item is not pose-ready: %s" % pose_error)
+
+        archive_batch = snapshot["archive_batch"]
+        archive_key = snapshot["archive_key"]
+        archive_path = self.archive_root() / archive_batch
+        manifest_path = archive_path / "annotations.jsonl"
+        if not manifest_path.is_file():
+            raise ValueError("archive manifest not found")
+
+        records = []
+        matched = False
+        updated_at = _now()
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, 1):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as error:
+                    raise ValueError(
+                        "invalid JSON in %s:%d: %s" % (manifest_path, line_number, error)
+                    )
+                record_key = str(record.get("image_md5") or record.get("image_id") or line_number)
+                if record_key == archive_key:
+                    review = dict(record.get("review") or {})
+                    review.update({
+                        "status": status,
+                        "reviewed": bool(payload.get("reviewed")),
+                        "note": str(payload.get("note") or "")[:2000],
+                        "updated_at": updated_at,
+                        "version": snapshot["version"] + 1,
+                    })
+                    record["review"] = review
+                    record["detections"] = [
+                        {
+                            "polygon": annotation["polygon"],
+                            "score": annotation["score"],
+                            "class_id": annotation["class_id"],
+                            "class_name": annotation["class_name"],
+                            "keypoint_names": list(KEYPOINT_NAMES),
+                            "keypoint_visibility": annotation["keypoint_visibility"],
+                            "keypoint_semantics": annotation["keypoint_semantics"],
+                        }
+                        for annotation in normalized
+                    ]
+                    matched = True
+                records.append(record)
+        if not matched:
+            raise ValueError("archive record not found")
+
+        serialized = "".join(
+            json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n"
+            for record in records
+        )
+        updated_record = next(
+            record for index, record in enumerate(records, 1)
+            if str(record.get("image_md5") or record.get("image_id") or index) == archive_key
+        )
+        image_md5 = _archive_record_md5(archive_path, updated_record)
+        record_path = archive_path / "records" / (image_md5 + ".json")
+        label_path = archive_path / "labels" / (image_md5 + ".txt")
+        report_path = archive_path / "archive_report.json"
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            report = {}
+        accepted = sum(
+            1 for record in records
+            if (record.get("review") or {}).get("status", "accepted") == "accepted"
+        )
+        report.update({
+            "archive_batch": archive_batch,
+            "archived_images": len(records),
+            "accepted_images": accepted,
+            "excluded_images": len(records) - accepted,
+            "correction_revisions": int(report.get("correction_revisions") or 0) + 1,
+            "updated_at": _now(),
+        })
+        updates = {
+            manifest_path: serialized,
+            record_path: json.dumps(updated_record, ensure_ascii=True, indent=2) + "\n",
+            report_path: json.dumps(report, ensure_ascii=True, indent=2) + "\n",
+        }
+        if status == "accepted":
+            label_lines = [
+                yolo_pose_line(annotation, snapshot["width"], snapshot["height"])
+                for annotation in normalized
+            ]
+            updates[label_path] = "\n".join(label_lines) + "\n"
+        elif label_path.exists() or label_path.is_symlink():
+            updates[label_path] = None
+
+        backup_root = Path(tempfile.mkdtemp(prefix=".archive-edit-backup-", dir=str(archive_path.parent)))
+        backups = {}
+        try:
+            for index, path in enumerate(updates):
+                backup = backup_root / str(index)
+                exists = path.exists() or path.is_symlink()
+                backups[path] = (backup, exists)
+                if path.is_symlink():
+                    backup.symlink_to(os.readlink(path))
+                elif exists:
+                    os.link(str(path), str(backup))
+
+            for path, content in updates.items():
+                if content is None:
+                    path.unlink()
+                else:
+                    _atomic_write_text(path, content)
+            manifest_stat = manifest_path.stat()
+            with self.connection:
+                cursor = self.connection.execute(
+                    "UPDATE archive_items SET status=?,reviewed=?,note=?,updated_at=?,"
+                    "pose_ready=?,pose_error=?,version=? WHERE id=?",
+                    (
+                        status,
+                        1 if payload.get("reviewed") else 0,
+                        str(payload.get("note") or "")[:2000],
+                        updated_at,
+                        1 if pose_ready else 0,
+                        "" if pose_ready or status != "accepted" else pose_error,
+                        snapshot["version"] + 1,
+                        -int(item_id),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("archive item not found")
+                self.connection.execute(
+                    "DELETE FROM archive_annotations WHERE archive_item_id=?",
+                    (-int(item_id),),
+                )
+                for index, annotation in enumerate(normalized):
+                    self.connection.execute(
+                        "INSERT INTO archive_annotations(archive_item_id,class_id,class_name,score,"
+                        "polygon_json,source_index,keypoint_visibility_json,keypoint_semantics) "
+                        "VALUES(?,?,?,?,?,?,?,?)",
+                        (
+                            -int(item_id),
+                            annotation["class_id"],
+                            annotation["class_name"],
+                            annotation["score"],
+                            json.dumps(annotation["polygon"], separators=(",", ":")),
+                            annotation.get("source_index", index),
+                            json.dumps(
+                                annotation["keypoint_visibility"], separators=(",", ":")
+                            ),
+                            annotation["keypoint_semantics"],
+                        ),
+                    )
+                self.connection.execute(
+                    "INSERT INTO archive_manifest_state(archive_batch,manifest_path,modified_ns,size) "
+                    "VALUES(?,?,?,?) ON CONFLICT(archive_batch) DO UPDATE SET "
+                    "manifest_path=excluded.manifest_path,modified_ns=excluded.modified_ns,"
+                    "size=excluded.size",
+                    (
+                        archive_batch,
+                        str(manifest_path),
+                        manifest_stat.st_mtime_ns,
+                        manifest_stat.st_size,
+                    ),
+                )
+        except Exception:
+            for path, (backup, existed) in backups.items():
+                if path.exists() or path.is_symlink():
+                    path.unlink()
+                if existed:
+                    os.replace(str(backup), str(path))
+            raise
+        finally:
+            shutil.rmtree(str(backup_root), ignore_errors=True)
+
+        with self.connection:
+            stale_corrections = list(self.connection.execute(
+                "SELECT id,image_md5 FROM items WHERE archived=0 AND archive_origin_batch=? "
+                "AND archive_origin_key=?",
+                (archive_batch, archive_key),
+            ))
+            self.connection.execute(
+                "DELETE FROM items WHERE archived=0 AND archive_origin_batch=? AND archive_origin_key=?",
+                (archive_batch, archive_key),
+            )
+        for correction in stale_corrections:
+            self._remove_candidate_files(correction["image_md5"])
+
+        row = self.connection.execute(
+            "SELECT id FROM archive_items WHERE archive_batch=? AND archive_key=?",
+            (archive_batch, archive_key),
+        ).fetchone()
+        return self.get_item(-row["id"]) if row else None
 
     def _prepare_archive_correction(self, item_id, payload):
         snapshot = self.get_item(item_id)
@@ -1526,7 +1778,7 @@ class ReviewStore:
                 if path.exists() or path.is_symlink():
                     path.unlink()
 
-    def archive_saved(self, review_batch=None, all_candidates=False, confirm_pose_semantics=False):
+    def archive_saved(self, review_batch=None, all_candidates=False):
         review_batch = review_batch or self.meta("active_review_batch")
         batch = self.review_batch(review_batch)
         if not batch:
@@ -1551,16 +1803,11 @@ class ReviewStore:
                 annotations = [self._annotation(value) for value in self.connection.execute(
                     "SELECT * FROM annotations WHERE item_id=? ORDER BY id", (row["id"],)
                 )]
-                if confirm_pose_semantics:
-                    for annotation in annotations:
-                        annotation["keypoint_semantics"] = KEYPOINT_SEMANTICS
                 pose_ready, pose_error = self._pose_readiness(annotations, row)
                 if not pose_ready:
                     blocked.append((row["id"], pose_error))
                 archive_annotations[row["id"]] = annotations
             if blocked:
-                if not confirm_pose_semantics and all("confirm canonical" in error for _, error in blocked):
-                    raise ValueError("%d candidates have unconfirmed pose labels" % len(blocked))
                 raise ValueError(
                     "%d candidates are not pose-ready; item %d: %s"
                     % (len(blocked), blocked[0][0], blocked[0][1])
@@ -1568,7 +1815,7 @@ class ReviewStore:
         else:
             if batch["blocked_count"]:
                 raise ValueError(
-                    "review batch has %d accepted items with unconfirmed pose labels" % batch["blocked_count"]
+                    "review batch has %d accepted items with invalid pose labels" % batch["blocked_count"]
                 )
             rows = list(self.connection.execute(
                 "SELECT * FROM items WHERE reviewed=1 AND archived=0 AND review_batch=? AND "
@@ -1712,13 +1959,6 @@ class ReviewStore:
                         row["id"] for row in rows
                         if row["status"] == "accepted" and row["id"] in archived_ids
                     ]
-                    if confirm_pose_semantics:
-                        accepted_placeholders = ",".join("?" for _ in accepted_ids)
-                        self.connection.execute(
-                            "UPDATE annotations SET keypoint_semantics=? WHERE item_id IN (%s)"
-                            % accepted_placeholders,
-                            [KEYPOINT_SEMANTICS] + accepted_ids,
-                        )
                     self.connection.execute(
                         "UPDATE items SET reviewed=1,review_batch=?,archived=1,archived_at=?,archive_batch=?,"
                         "version=version+1,updated_at=? WHERE archived=0 AND id IN (%s)" % placeholders,
@@ -1776,7 +2016,6 @@ class ReviewStore:
             int(part) for part in (value.get("class_ids") or "").split(",") if part
         ]
         value["archived"] = 1
-        value["version"] = 1
         value["supersedes_archive_batch"] = None
         value["input_index"] = 0
         value["has_correction"] = bool(value.get("correction_id"))
@@ -1817,16 +2056,13 @@ class ReviewStore:
         visibility = [int(entry) for entry in visibility]
         if any(entry not in (0, 1, 2) for entry in visibility):
             raise ValueError("keypoint visibility must be 0, 1, or 2")
-        semantics = str(value.get("keypoint_semantics") or UNCONFIRMED_KEYPOINT_SEMANTICS)
-        if semantics not in (UNCONFIRMED_KEYPOINT_SEMANTICS, KEYPOINT_SEMANTICS):
-            raise ValueError("unknown keypoint semantics")
         return {
             "class_id": class_id,
             "class_name": classes[class_id],
             "score": float(score) if score is not None else None,
             "polygon": points,
             "keypoint_visibility": visibility,
-            "keypoint_semantics": semantics,
+            "keypoint_semantics": KEYPOINT_SEMANTICS,
             "source_index": value.get("source_index"),
         }
 
@@ -1834,9 +2070,7 @@ class ReviewStore:
         if not annotations:
             return False, "at least one target is required"
         for index, annotation in enumerate(annotations, 1):
-            if annotation["keypoint_semantics"] != KEYPOINT_SEMANTICS:
-                return False, "target %d: confirm canonical K0-K3 semantics" % index
-            if any(value == 0 for value in annotation["keypoint_visibility"]):
+            if any(value == 0 for value in annotation.get("keypoint_visibility", [2, 2, 2, 2])):
                 return False, "target %d: all four keypoints must be labeled" % index
             try:
                 validate_keypoints(annotation["polygon"], item["width"], item["height"])
@@ -1946,8 +2180,6 @@ def _write_coco_keypoints_dataset(root, records, classes, assignments, split_cou
         })
         for detection in record.get("detections", []):
             points = detection["polygon"]
-            if detection.get("keypoint_semantics") != KEYPOINT_SEMANTICS:
-                raise ValueError("COCO export requires confirmed canonical keypoint semantics")
             validate_keypoints(points, width, height)
             visibility = detection.get("keypoint_visibility") or [2, 2, 2, 2]
             if len(visibility) != 4 or any(int(value) not in (0, 1, 2) for value in visibility):

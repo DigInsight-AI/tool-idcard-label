@@ -4,7 +4,6 @@ import struct
 
 from .geometry import (
     KEYPOINT_NAMES,
-    KEYPOINT_SEMANTICS,
     bbox_from_keypoints,
     validate_keypoints,
 )
@@ -98,8 +97,6 @@ def _webp_dimensions(header):
 
 def yolo_pose_line(annotation, width, height):
     points = annotation["polygon"]
-    if annotation.get("keypoint_semantics") != KEYPOINT_SEMANTICS:
-        raise ValueError("pose export requires confirmed canonical keypoint semantics")
     validate_keypoints(points, width, height)
     left, top, right, bottom = bbox_from_keypoints(points)
     values = [

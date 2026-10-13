@@ -25,7 +25,6 @@ const CLASS_COLORS = [
 ];
 const KEYPOINT_NAMES = ["K0 TL", "K1 TR", "K2 BR", "K3 BL"];
 const CANONICAL_SEMANTICS = "idcard_canonical_v1";
-const UNCONFIRMED_SEMANTICS = "idcard_unconfirmed_v1";
 const CORNER_HIT_RADIUS = 24;
 const DECISION_BUTTON_IDS = [
   "rejectButton", "reviewButton", "reviewedButton", "saveButton", "acceptButton",
@@ -39,7 +38,7 @@ const elements = Object.fromEntries([
   "archiveManagerButton", "acceptButton", "addTargetButton", "targetTitle", "targetList", "reviewNote", "saveReviewButton", "currentStatus", "toast",
   "archiveAllCandidatesButton", "archiveAllCandidatesDialog", "archiveAllCandidatesForm", "archiveAllCandidatesClose",
   "archiveAllCandidatesSummary", "candidateArchiveBatchSelect", "newCandidateArchiveBatchField", "newCandidateArchiveBatchName",
-  "bulkConfirmPoseField", "bulkConfirmPose", "archiveAllCandidatesCancel", "archiveAllCandidatesSubmit",
+  "archiveAllCandidatesCancel", "archiveAllCandidatesSubmit",
   "batchSelect", "newBatchButton", "settingsButton", "settingsDialog", "settingsForm", "settingsCancelButton", "settingsCloseButton",
   "inputRootPath", "outputRootPath", "modelDirectoryPath", "archiveDialog", "archiveMergeForm", "archiveDialogClose",
   "archiveBatchList", "mergedFolderNameField", "mergedFolderName", "mergeDestinationArchiveField", "mergeDestinationArchive",
@@ -130,7 +129,6 @@ function bindEvents() {
   elements.archiveAllCandidatesCancel.addEventListener("click", closeArchiveAllCandidates);
   elements.candidateArchiveBatchSelect.addEventListener("change", updateArchiveAllCandidatesForm);
   elements.newCandidateArchiveBatchName.addEventListener("input", updateArchiveAllCandidatesForm);
-  elements.bulkConfirmPose.addEventListener("change", updateArchiveAllCandidatesForm);
   elements.archiveAllCandidatesForm.addEventListener("submit", archiveAllCandidates);
   elements.archiveManagerButton.addEventListener("click", openArchiveManager);
   elements.archiveDialogClose.addEventListener("click", () => elements.archiveDialog.close());
@@ -222,12 +220,12 @@ function renderQueue(counts) {
   elements.queue.replaceChildren();
   for (const item of state.list) {
     const button = document.createElement("button");
-    const selected = state.current?.id === item.id || state.current?.id === item.correction_id;
+    const selected = state.current?.id === item.id;
     button.className = `queue-item${selected ? " selected" : ""}`;
     button.innerHTML = `
       <span class="queue-name" title="${escapeHtml(item.file_name)}">${escapeHtml(item.file_name)}</span>
-      <span class="queue-meta"><i class="status-dot ${item.status}"></i>#${item.id} · ${item.annotation_count} targets · ${formatScore(item.min_score)}${item.has_correction ? '<b class="correction-mark" title="Correction pending">↻</b>' : ""}${item.archived ? `<b class="archive-mark" title="${escapeHtml(item.archive_batch || "Archived")}">${escapeHtml(archiveDate(item))}</b>` : ""}${item.reviewed ? '<b class="review-mark" title="Reviewed">✓</b>' : ""}</span>`;
-    button.addEventListener("click", () => selectItem(item.correction_id || item.id));
+      <span class="queue-meta"><i class="status-dot ${item.status}"></i>#${item.id} · ${item.annotation_count} targets · ${formatScore(item.min_score)}${item.has_correction ? '<b class="correction-mark" title="Previous correction pending; save this archive item to apply directly">↻</b>' : ""}${item.archived ? `<b class="archive-mark" title="${escapeHtml(item.archive_batch || "Archived")}">${escapeHtml(archiveDate(item))}</b>` : ""}${item.reviewed ? '<b class="review-mark" title="Reviewed">✓</b>' : ""}</span>`;
+    button.addEventListener("click", () => selectItem(item.id));
     elements.queue.append(button);
   }
   const pages = Math.max(1, Math.ceil(state.total / state.pageSize));
@@ -659,7 +657,6 @@ function renderTargets() {
         <button type="button" class="corner-rotate" data-direction="-1" title="Shift K0-K3 labels one corner counterclockwise (Shift+T)">K &#8630;</button>
         <button type="button" class="corner-rotate" data-direction="1" title="Shift K0-K3 labels one corner clockwise (T)">K &#8631; <kbd>T</kbd></button>
         <button type="button" class="corner-reverse" title="Reverse K0-K3 winding while keeping K0 fixed">&#8644;</button>
-        <label class="semantic-confirm"><input type="checkbox" ${annotation.keypoint_semantics === CANONICAL_SEMANTICS ? "checked" : ""}> Canonical K0-K3 confirmed</label>
       </div>
       <div class="keypoint-list">
         ${(annotation.polygon || []).map((_, pointIndex) => `
@@ -692,13 +689,6 @@ function renderTargets() {
     target.querySelector(".corner-reverse").addEventListener("click", (event) => {
       event.stopPropagation();
       reverseKeypoints(index);
-    });
-    target.querySelector(".semantic-confirm input").addEventListener("change", (event) => {
-      event.stopPropagation();
-      pushUndo();
-      annotation.keypoint_semantics = event.target.checked ? CANONICAL_SEMANTICS : UNCONFIRMED_SEMANTICS;
-      markDirty();
-      draw();
     });
     target.querySelectorAll(".keypoint-list select").forEach((select) => select.addEventListener("change", (event) => {
       event.stopPropagation();
@@ -799,11 +789,11 @@ async function saveCurrent(status, advance, reviewedOverride = null, reviewAppro
   const previousIndex = state.list.findIndex((item) => item.id === state.current.id);
   try {
     const updated = await persistCurrent(status, reviewedOverride, reviewApproved);
-    const message = {
+    const message = state.current.archived ? "Archive updated" : ({
       accepted: updated.reviewed ? "Candidate approved for archive" : "Added to candidate review",
       rejected: "Image rejected",
       needs_review: "Sent to follow-up review",
-    }[status] || "Review saved";
+    }[status] || "Review saved");
     if (status === "accepted" && !updated.pose_ready) {
       showToast(`Review saved, but not ready for archive approval: ${updated.pose_error}`, true);
       await loadQueue(false);
@@ -841,7 +831,7 @@ async function persistCurrent(status, reviewedOverride = null, reviewApproved = 
       source_index: annotation.source_index,
       polygon: annotation.polygon,
       keypoint_visibility: annotation.keypoint_visibility || [2, 2, 2, 2],
-      keypoint_semantics: annotation.keypoint_semantics || UNCONFIRMED_SEMANTICS,
+      keypoint_semantics: CANONICAL_SEMANTICS,
     })),
   };
   const updated = await request(`/api/items/${state.current.id}`, { method: "PUT", body: JSON.stringify(payload) });
@@ -855,7 +845,7 @@ async function saveReview() {
   if (!state.current) return;
   try {
     const updated = await persistCurrent(state.current.status);
-    showToast(correctionSaveMessage(updated) || "Review content saved");
+    showToast(updated.archived ? "Archive updated" : (correctionSaveMessage(updated) || "Review content saved"));
     await loadQueue(false);
   } catch (error) {
     showToast(error.message, true);
@@ -864,7 +854,6 @@ async function saveReview() {
 
 async function saveCandidate() {
   if (!state.current) return;
-  confirmCandidatePoseSemantics();
   try {
     const updated = await persistCurrent("accepted", false);
     correctionSaveMessage(updated);
@@ -874,24 +863,12 @@ async function saveCandidate() {
       await loadQueue(false);
       return;
     }
-    showToast("Added to candidate review");
+    showToast(updated.archived ? "Archive updated" : "Added to candidate review");
     await loadQueue(false);
     await advanceAfterSave();
   } catch (error) {
     showToast(error.message, true);
   }
-}
-
-function confirmCandidatePoseSemantics() {
-  const unconfirmed = state.current?.annotations.filter(
-    (annotation) => annotation.keypoint_semantics !== CANONICAL_SEMANTICS,
-  ) || [];
-  if (!unconfirmed.length) return;
-  pushUndo();
-  for (const annotation of unconfirmed) annotation.keypoint_semantics = CANONICAL_SEMANTICS;
-  markDirty();
-  renderTargets();
-  draw();
 }
 
 async function approveCandidate() {
@@ -1051,7 +1028,6 @@ function rotateKeypoints(index, direction) {
   annotation.polygon = annotation.polygon.map((_, pointIndex, points) => points[(pointIndex + shift) % 4]);
   const visibility = annotation.keypoint_visibility || [2, 2, 2, 2];
   annotation.keypoint_visibility = visibility.map((_, pointIndex, values) => values[(pointIndex + shift) % 4]);
-  annotation.keypoint_semantics = UNCONFIRMED_SEMANTICS;
   state.activeAnnotation = index;
   state.selectedAnnotations = new Set([index]);
   markDirty();
@@ -1066,7 +1042,6 @@ function reverseKeypoints(index) {
   annotation.polygon = [annotation.polygon[0], annotation.polygon[3], annotation.polygon[2], annotation.polygon[1]];
   const visibility = annotation.keypoint_visibility || [2, 2, 2, 2];
   annotation.keypoint_visibility = [visibility[0], visibility[3], visibility[2], visibility[1]];
-  annotation.keypoint_semantics = UNCONFIRMED_SEMANTICS;
   state.activeAnnotation = index;
   state.selectedAnnotations = new Set([index]);
   markDirty();
@@ -1197,12 +1172,7 @@ function openArchiveAllCandidates() {
   elements.candidateArchiveBatchSelect.value = "";
   elements.newCandidateArchiveBatchName.value = `Archive ${localVersionStamp()}`;
   const candidateCount = state.counts?.candidates || state.config?.counts?.candidates || 0;
-  const unconfirmedCount = state.counts?.candidate_pose_unconfirmed || state.config?.counts?.candidate_pose_unconfirmed || 0;
-  elements.archiveAllCandidatesSummary.textContent = unconfirmedCount
-    ? `${candidateCount} candidates will be archived; ${unconfirmedCount} require canonical Pose confirmation.`
-    : `${candidateCount} candidates will be approved and written to one immutable archive.`;
-  elements.bulkConfirmPoseField.hidden = unconfirmedCount === 0;
-  elements.bulkConfirmPose.checked = true;
+  elements.archiveAllCandidatesSummary.textContent = `${candidateCount} candidates will be approved and written to one archive.`;
   updateArchiveAllCandidatesForm();
   elements.archiveAllCandidatesDialog.showModal();
 }
@@ -1215,9 +1185,7 @@ function updateArchiveAllCandidatesForm() {
   const creating = elements.candidateArchiveBatchSelect.value === "__new__";
   elements.newCandidateArchiveBatchField.hidden = !creating;
   elements.newCandidateArchiveBatchName.required = creating;
-  const unconfirmedCount = state.counts?.candidate_pose_unconfirmed || state.config?.counts?.candidate_pose_unconfirmed || 0;
-  const poseConfirmationMissing = unconfirmedCount > 0 && !elements.bulkConfirmPose.checked;
-  elements.archiveAllCandidatesSubmit.disabled = (creating && !elements.newCandidateArchiveBatchName.value.trim()) || poseConfirmationMissing;
+  elements.archiveAllCandidatesSubmit.disabled = creating && !elements.newCandidateArchiveBatchName.value.trim();
 }
 
 async function archiveAllCandidates(event) {
@@ -1245,7 +1213,6 @@ async function archiveAllCandidates(event) {
       body: JSON.stringify({
         review_batch: reviewBatch,
         all_candidates: true,
-        confirm_pose_semantics: elements.bulkConfirmPose.checked,
         merge_into_archive: !creating && elements.candidateArchiveBatchSelect.value || undefined,
       }),
     });
@@ -1492,7 +1459,7 @@ function markDirty() {
   state.dirty = true;
   if (state.current?.archived && !state.correctionNoticeShown) {
     state.correctionNoticeShown = true;
-    showToast("Editing archived item; saving creates a correction revision");
+    showToast("Editing archived item; saving updates the archive immediately");
   }
 }
 

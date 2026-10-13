@@ -248,6 +248,13 @@ def _validate_workspace_directories(input_root, output_root):
 class ReviewHandler(BaseHTTPRequestHandler):
     server_version = "IDCardReview/%s" % __version__
 
+    def handle(self):
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionResetError):
+            # Browsers can cancel in-flight asset and image requests during navigation.
+            self.close_connection = True
+
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/api/config":
@@ -379,7 +386,6 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 if payload.get("all_candidates"):
                     result = self.server.store.archive_all_candidates(
                         payload.get("review_batch"),
-                        confirm_pose_semantics=bool(payload.get("confirm_pose_semantics")),
                         merge_into_archive=payload.get("merge_into_archive"),
                     )
                 else:

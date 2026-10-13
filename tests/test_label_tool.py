@@ -5,21 +5,24 @@ import tempfile
 import threading
 import unittest
 from contextlib import redirect_stdout
+from http.server import BaseHTTPRequestHandler
 from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from idcard_label import __version__
 from idcard_label.cli import build_parser
 from idcard_label.formats import image_dimensions
-from idcard_label.geometry import KEYPOINT_SEMANTICS
+from idcard_label.geometry import KEYPOINT_SEMANTICS, UNCONFIRMED_KEYPOINT_SEMANTICS
 from idcard_label.server import (
+    ReviewHandler,
     ReviewServer,
     WorkspaceConfirmationRequired,
     _validate_workspace_directories,
 )
-from idcard_label.store import ReviewStore
+from idcard_label.store import ConflictError, ReviewStore, _atomic_write_text
 
 
 class LabelToolTest(unittest.TestCase):
@@ -254,7 +257,7 @@ class LabelToolTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "at least one target"):
                     store.archive_saved()
                 with self.assertRaisesRegex(ValueError, "at least one target"):
-                    store.archive_all_candidates(confirm_pose_semantics=True)
+                    store.archive_all_candidates()
             finally:
                 store.close()
 
@@ -338,6 +341,14 @@ class LabelToolTest(unittest.TestCase):
         self.assertNotIn('<option value="ignored">', html)
         self.assertNotIn('decisionActionAvailable("ignoreButton")', javascript)
 
+    def test_pose_confirmation_controls_are_not_exposed_in_the_review_ui(self):
+        static_root = Path(__file__).parents[1] / "idcard_label" / "static"
+        html = (static_root / "index.html").read_text(encoding="utf-8")
+        javascript = (static_root / "app.js").read_text(encoding="utf-8")
+        self.assertNotIn("Canonical K0-K3 confirmed", javascript)
+        self.assertNotIn("bulkConfirmPose", html)
+        self.assertNotIn("bulkConfirmPose", javascript)
+
     def test_export_archive_batch_creates_trainable_pose_dataset(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -351,7 +362,7 @@ class LabelToolTest(unittest.TestCase):
                     "version": item["version"], "status": "accepted", "reviewed": False,
                     "annotations": self.annotations(),
                 })
-                archived = store.archive_all_candidates(confirm_pose_semantics=True)
+                archived = store.archive_all_candidates()
                 exported = store.export_archive_batch(archived["archive_batch"], root / "export")
                 dataset = Path(exported["path"])
                 data_yaml = (dataset / "data.yaml").read_text(encoding="utf-8")
@@ -389,7 +400,7 @@ class LabelToolTest(unittest.TestCase):
                     "version": item["version"], "status": "accepted", "reviewed": False,
                     "annotations": self.annotations(),
                 })
-                archived = store.archive_all_candidates(confirm_pose_semantics=True)
+                archived = store.archive_all_candidates()
                 archive_path = Path(archived["path"])
                 manifest_path = archive_path / "annotations.jsonl"
                 record = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -418,7 +429,7 @@ class LabelToolTest(unittest.TestCase):
                     "version": item["version"], "status": "accepted", "reviewed": False,
                     "annotations": self.annotations(),
                 })
-                archived = store.archive_all_candidates(confirm_pose_semantics=True)
+                archived = store.archive_all_candidates()
                 exported = store.export_archive_batch(
                     archived["archive_batch"], root / "export", "coco_keypoints"
                 )
@@ -465,7 +476,7 @@ class LabelToolTest(unittest.TestCase):
                         "reviewed": False,
                         "annotations": self.annotations(),
                     })
-                archived = store.archive_all_candidates(confirm_pose_semantics=True)
+                archived = store.archive_all_candidates()
                 exported = store.export_archive_batch(archived["archive_batch"], root / "export")
                 dataset = Path(exported["path"])
                 train_images = list((dataset / "images" / "train").glob("*"))
@@ -523,7 +534,7 @@ class LabelToolTest(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_archive_review_creates_a_correction_without_removing_the_snapshot(self):
+    def test_archive_review_updates_snapshot_and_export_immediately(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             self.write_image(root / "card.jpg")
@@ -537,45 +548,38 @@ class LabelToolTest(unittest.TestCase):
                     "reviewed": False,
                     "annotations": self.annotations(),
                 })
-                archived = store.archive_all_candidates(confirm_pose_semantics=True)
+                archived = store.archive_all_candidates()
                 archive_batch = archived["archive_batch"]
                 archive_list = store.list_items({"status": "archive", "archive_batch": archive_batch})
                 self.assertEqual(archive_list["total"], 1)
                 snapshot = store.get_item(archive_list["items"][0]["id"])
-                original_polygon = snapshot["annotations"][0]["polygon"]
                 corrected_annotations = self.annotations()
                 corrected_annotations[0]["polygon"][0] = [12, 12]
 
-                correction = store.update_item(snapshot["id"], {
+                updated = store.update_item(snapshot["id"], {
                     "version": snapshot["version"],
                     "status": "accepted",
-                    "reviewed": False,
+                    "reviewed": True,
                     "annotations": corrected_annotations,
                 })
 
-                self.assertGreater(correction["id"], 0)
-                self.assertFalse(correction["archived"])
-                self.assertEqual(correction["supersedes_archive_batch"], archive_batch)
-                archive_with_correction = store.list_items({
+                self.assertLess(updated["id"], 0)
+                self.assertTrue(updated["archived"])
+                self.assertEqual(updated["annotations"][0]["polygon"][0], [12.0, 12.0])
+                archive_after_update = store.list_items({
                     "status": "archive", "archive_batch": archive_batch
                 })
-                self.assertEqual(archive_with_correction["total"], 1)
-                self.assertTrue(archive_with_correction["items"][0]["has_correction"])
-                self.assertEqual(
-                    archive_with_correction["items"][0]["correction_id"], correction["id"]
-                )
-                self.assertEqual(store.get_item(snapshot["id"])["annotations"][0]["polygon"], original_polygon)
-                self.assertEqual(store.list_items({"status": "candidate"})["total"], 1)
-
-                store.archive_all_candidates(
-                    confirm_pose_semantics=True,
-                    merge_into_archive=archive_batch,
-                )
-                final_list = store.list_items({"status": "archive", "archive_batch": archive_batch})
-                self.assertEqual(final_list["total"], 1)
-                final_item = store.get_item(final_list["items"][0]["id"])
-                self.assertEqual(final_item["annotations"][0]["polygon"][0], [12, 12])
+                self.assertEqual(archive_after_update["total"], 1)
+                final_item = store.get_item(archive_after_update["items"][0]["id"])
+                self.assertEqual(final_item["annotations"][0]["polygon"][0], [12.0, 12.0])
                 self.assertEqual(store.list_items({"status": "candidate"})["total"], 0)
+                manifest_record = json.loads(
+                    (Path(archived["path"]) / "annotations.jsonl").read_text(encoding="utf-8")
+                )
+                self.assertEqual(manifest_record["detections"][0]["polygon"][0], [12.0, 12.0])
+                exported = store.export_archive_batch(archive_batch, root / "export")
+                label = next((Path(exported["path"]) / "labels" / "train").glob("*.txt"))
+                self.assertIn("0.12 0.15", label.read_text(encoding="utf-8"))
                 report = json.loads(
                     (Path(archived["path"]) / "archive_report.json").read_text(encoding="utf-8")
                 )
@@ -584,7 +588,125 @@ class LabelToolTest(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_archive_review_can_reject_and_merge_the_final_decision(self):
+    def test_archive_class_change_normalizes_legacy_pose_without_confirmation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.write_image(root / "card.jpg")
+            store = ReviewStore(root / "workspace", workspace_class_id=0)
+            try:
+                store.initialize(root)
+                item = store.get_item(store.list_items({"status": "pending"})["items"][0]["id"])
+                store.update_item(item["id"], {
+                    "version": item["version"],
+                    "status": "accepted",
+                    "reviewed": False,
+                    "annotations": self.annotations(),
+                })
+                archived = store.archive_all_candidates()
+                archive_path = Path(archived["path"])
+                record = json.loads((archive_path / "annotations.jsonl").read_text(encoding="utf-8"))
+                record["detections"][0]["keypoint_semantics"] = UNCONFIRMED_KEYPOINT_SEMANTICS
+                (archive_path / "annotations.jsonl").write_text(
+                    json.dumps(record, separators=(",", ":")) + "\n", encoding="utf-8"
+                )
+                store.sync_archive_index()
+
+                snapshot_id = store.list_items({
+                    "status": "archive", "archive_batch": archived["archive_batch"]
+                })["items"][0]["id"]
+                snapshot = store.get_item(snapshot_id)
+                self.assertTrue(snapshot["pose_ready"])
+                annotations = snapshot["annotations"]
+                annotations[0]["class_id"] = 1
+                annotations[0]["class_name"] = "class_1"
+
+                with patch.object(
+                    store, "sync_archive_index", side_effect=AssertionError("full reindex")
+                ), patch(
+                    "idcard_label.store.shutil.copytree", side_effect=AssertionError("full copy")
+                ):
+                    updated = store.update_item(snapshot_id, {
+                        "version": snapshot["version"],
+                        "status": "accepted",
+                        "reviewed": True,
+                        "annotations": annotations,
+                    })
+
+                self.assertEqual(updated["annotations"][0]["class_id"], 1)
+                self.assertEqual(
+                    updated["annotations"][0]["keypoint_semantics"],
+                    KEYPOINT_SEMANTICS,
+                )
+                label = next((archive_path / "labels").glob("*.txt"))
+                self.assertEqual(label.read_text(encoding="utf-8").split()[0], "1")
+
+                label.unlink()
+                annotations = updated["annotations"]
+                annotations[0]["class_id"] = 0
+                annotations[0]["class_name"] = "class_0"
+                with patch.object(
+                    store, "sync_archive_index", side_effect=AssertionError("full reindex")
+                ), patch(
+                    "idcard_label.store.shutil.copytree", side_effect=AssertionError("full copy")
+                ):
+                    updated_without_label = store.update_item(snapshot_id, {
+                        "version": updated["version"],
+                        "status": "accepted",
+                        "reviewed": True,
+                        "annotations": annotations,
+                })
+
+                self.assertEqual(updated_without_label["annotations"][0]["class_id"], 0)
+                self.assertTrue(label.exists())
+                self.assertEqual(label.read_text(encoding="utf-8").split()[0], "0")
+            finally:
+                store.close()
+
+    def test_archive_pose_change_accepts_legacy_semantics_without_confirmation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.write_image(root / "card.jpg")
+            store = ReviewStore(root / "workspace", workspace_class_id=0)
+            try:
+                store.initialize(root)
+                item = store.get_item(store.list_items({"status": "pending"})["items"][0]["id"])
+                store.update_item(item["id"], {
+                    "version": item["version"],
+                    "status": "accepted",
+                    "reviewed": False,
+                    "annotations": self.annotations(),
+                })
+                archived = store.archive_all_candidates()
+                archive_path = Path(archived["path"])
+                record = json.loads((archive_path / "annotations.jsonl").read_text(encoding="utf-8"))
+                record["detections"][0]["keypoint_semantics"] = UNCONFIRMED_KEYPOINT_SEMANTICS
+                (archive_path / "annotations.jsonl").write_text(
+                    json.dumps(record, separators=(",", ":")) + "\n", encoding="utf-8"
+                )
+                store.sync_archive_index()
+                snapshot_id = store.list_items({
+                    "status": "archive", "archive_batch": archived["archive_batch"]
+                })["items"][0]["id"]
+                snapshot = store.get_item(snapshot_id)
+                snapshot["annotations"][0]["polygon"][0] = [12, 12]
+
+                updated = store.update_item(snapshot_id, {
+                    "version": snapshot["version"],
+                    "status": "accepted",
+                    "reviewed": True,
+                    "annotations": snapshot["annotations"],
+                })
+
+                self.assertTrue(updated["pose_ready"])
+                self.assertEqual(updated["annotations"][0]["polygon"][0], [12.0, 12.0])
+                self.assertEqual(
+                    updated["annotations"][0]["keypoint_semantics"],
+                    KEYPOINT_SEMANTICS,
+                )
+            finally:
+                store.close()
+
+    def test_archive_review_rejection_is_effective_immediately(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             self.write_image(root / "card.jpg")
@@ -598,7 +720,7 @@ class LabelToolTest(unittest.TestCase):
                     "reviewed": False,
                     "annotations": self.annotations(),
                 })
-                archived = store.archive_all_candidates(confirm_pose_semantics=True)
+                archived = store.archive_all_candidates()
                 archive_batch = archived["archive_batch"]
                 snapshot_id = store.list_items({
                     "status": "archive", "archive_batch": archive_batch
@@ -612,15 +734,13 @@ class LabelToolTest(unittest.TestCase):
                     "annotations": [],
                 })
                 self.assertEqual(rejected["status"], "rejected")
-                self.assertEqual(rejected["supersedes_archive_batch"], archive_batch)
-
-                store.archive_all_candidates(
-                    confirm_pose_semantics=True,
-                    merge_into_archive=archive_batch,
-                )
+                self.assertTrue(rejected["archived"])
+                self.assertLess(rejected["id"], 0)
                 final_list = store.list_items({"status": "archive", "archive_batch": archive_batch})
                 self.assertEqual(final_list["total"], 1)
                 self.assertEqual(store.get_item(final_list["items"][0]["id"])["status"], "rejected")
+                with self.assertRaisesRegex(ValueError, "archive contains no accepted"):
+                    store.export_archive_batch(archive_batch, root / "export")
                 report = json.loads(
                     (Path(archived["path"]) / "archive_report.json").read_text(encoding="utf-8")
                 )
@@ -630,7 +750,75 @@ class LabelToolTest(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_follow_up_archive_correction_survives_reopening_the_workspace(self):
+    def test_concurrent_archive_updates_preserve_the_archive_and_reject_stale_save(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.write_image(root / "card.jpg")
+            store = ReviewStore(root / "workspace")
+            try:
+                store.initialize(root)
+                item = store.get_item(store.list_items({"status": "pending"})["items"][0]["id"])
+                store.update_item(item["id"], {
+                    "version": item["version"],
+                    "status": "accepted",
+                    "reviewed": False,
+                    "annotations": self.annotations(),
+                })
+                archived = store.archive_all_candidates()
+                snapshot_id = store.list_items({
+                    "status": "archive", "archive_batch": archived["archive_batch"]
+                })["items"][0]["id"]
+                snapshot = store.get_item(snapshot_id)
+                payload = {
+                    "version": snapshot["version"],
+                    "status": "accepted",
+                    "reviewed": True,
+                    "annotations": snapshot["annotations"],
+                }
+                first_write_started = threading.Event()
+                release_first_write = threading.Event()
+                write_calls = [0]
+
+                def delayed_write(path, content):
+                    if Path(path).name == "annotations.jsonl":
+                        write_calls[0] += 1
+                        if write_calls[0] == 1:
+                            first_write_started.set()
+                            self.assertTrue(release_first_write.wait(5))
+                    return _atomic_write_text(path, content)
+
+                results = []
+
+                def update_archive():
+                    try:
+                        results.append(store.update_item(snapshot_id, payload))
+                    except Exception as error:
+                        results.append(error)
+
+                with patch("idcard_label.store._atomic_write_text", side_effect=delayed_write):
+                    first = threading.Thread(target=update_archive)
+                    second = threading.Thread(target=update_archive)
+                    first.start()
+                    self.assertTrue(first_write_started.wait(5))
+                    second.start()
+                    release_first_write.set()
+                    first.join(5)
+                    second.join(5)
+
+                self.assertFalse(first.is_alive())
+                self.assertFalse(second.is_alive())
+                self.assertEqual(sum(isinstance(result, ConflictError) for result in results), 1)
+                updated = next(result for result in results if not isinstance(result, Exception))
+                self.assertEqual(updated["version"], snapshot["version"] + 1)
+                self.assertTrue(Path(archived["path"]).is_dir())
+                report = json.loads(
+                    (Path(archived["path"]) / "archive_report.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(report["correction_revisions"], 1)
+            finally:
+                store.close()
+
+    def test_immediate_archive_update_survives_reopening_the_workspace(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             self.write_image(root / "card.jpg")
@@ -644,29 +832,27 @@ class LabelToolTest(unittest.TestCase):
                 "reviewed": False,
                 "annotations": self.annotations(),
             })
-            archived = store.archive_all_candidates(confirm_pose_semantics=True)
+            archived = store.archive_all_candidates()
             snapshot = store.get_item(store.list_items({
                 "status": "archive", "archive_batch": archived["archive_batch"]
             })["items"][0]["id"])
-            correction = store.update_item(snapshot["id"], {
+            updated = store.update_item(snapshot["id"], {
                 "version": snapshot["version"],
                 "status": "needs_review",
                 "reviewed": False,
                 "annotations": snapshot["annotations"],
             })
-            correction_id = correction["id"]
+            self.assertTrue(updated["archived"])
             store.close()
 
             reopened = ReviewStore(workspace)
             try:
-                restored = reopened.get_item(correction_id)
-                self.assertIsNotNone(restored)
-                self.assertEqual(restored["status"], "needs_review")
-                self.assertEqual(restored["supersedes_archive_batch"], archived["archive_batch"])
                 archive_item = reopened.list_items({
                     "status": "archive", "archive_batch": archived["archive_batch"]
                 })["items"][0]
-                self.assertEqual(archive_item["correction_id"], correction_id)
+                restored = reopened.get_item(archive_item["id"])
+                self.assertEqual(restored["status"], "needs_review")
+                self.assertTrue(restored["archived"])
             finally:
                 reopened.close()
 
@@ -705,6 +891,20 @@ class LabelToolTest(unittest.TestCase):
                 self.assertEqual(config["app_version"], __version__)
             finally:
                 server.server_close()
+
+    def test_request_handler_ignores_client_disconnects(self):
+        for error in (BrokenPipeError(), ConnectionResetError()):
+            handler = object.__new__(ReviewHandler)
+            handler.close_connection = False
+            with patch.object(BaseHTTPRequestHandler, "handle", side_effect=error):
+                handler.handle()
+            self.assertTrue(handler.close_connection)
+
+    def test_request_handler_does_not_hide_other_io_errors(self):
+        handler = object.__new__(ReviewHandler)
+        with patch.object(BaseHTTPRequestHandler, "handle", side_effect=OSError("disk failure")):
+            with self.assertRaisesRegex(OSError, "disk failure"):
+                handler.handle()
 
     def test_missing_item_update_returns_a_structured_error(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -829,7 +1029,7 @@ class LabelToolTest(unittest.TestCase):
                     "reviewed": False,
                     "annotations": self.annotations(),
                 })
-                archived = server.store.archive_all_candidates(confirm_pose_semantics=True)
+                archived = server.store.archive_all_candidates()
                 exported = server.export_archive_batch(
                     archived["archive_batch"], export_root, "coco_keypoints"
                 )

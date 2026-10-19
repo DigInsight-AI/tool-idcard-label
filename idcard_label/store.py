@@ -394,8 +394,9 @@ class ReviewStore:
         now = _now()
         last_offset = start_offset
         reached_end = True
+        image_iter = enumerate(self._input_images(Path(input_root)), 1)
         with self.connection:
-            for offset, image_path in enumerate(self._input_images(Path(input_root)), 1):
+            for offset, image_path in image_iter:
                 if offset <= start_offset:
                     continue
                 last_offset = offset
@@ -430,10 +431,17 @@ class ReviewStore:
                         ") VALUES(?,?,?,?,?,?)",
                         (str(image_path), image_md5, width, height, offset, now),
                     )
-                if cursor.rowcount and existing + 1 >= required_count:
-                    reached_end = False
+                if not cursor.rowcount:
+                    continue
+                existing += 1
+                if existing >= required_count:
+                    try:
+                        next(image_iter)
+                    except StopIteration:
+                        reached_end = True
+                    else:
+                        reached_end = False
                     break
-                existing += cursor.rowcount
             self.set_meta("image_scan_offset", str(last_offset))
             self.set_meta("image_scan_complete", "1" if reached_end else "0")
             self.set_meta("import_errors", json.dumps(errors, separators=(",", ":")))
@@ -1238,11 +1246,20 @@ class ReviewStore:
             """ % where,
             values + [page_size, (page - 1) * page_size],
         ).fetchall()
+        scan_complete = True
+        if status == "pending":
+            scan_complete = self.meta("image_scan_complete") == "1"
+            # Keep pagination open while more input images remain. The stored
+            # total is only the imported pending queue, so a full page would
+            # otherwise look like the last page and never request the next.
+            if not scan_complete and total >= page * page_size:
+                total = max(total, page * page_size + 1)
         return {
             "items": [self._summary(row) for row in rows],
             "page": page,
             "page_size": page_size,
             "total": total,
+            "scan_complete": scan_complete,
             "counts": self.status_counts(),
         }
 
@@ -1288,6 +1305,7 @@ class ReviewStore:
             "page": page,
             "page_size": page_size,
             "total": total,
+            "scan_complete": True,
             "counts": self.status_counts(),
         }
 

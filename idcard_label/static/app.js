@@ -3,6 +3,7 @@ const state = {
   counts: null,
   list: [],
   total: 0,
+  scanComplete: true,
   page: 1,
   pageSize: 50,
   current: null,
@@ -200,7 +201,8 @@ async function loadQueue(selectFirst = false) {
   ]);
   if (loadSequence !== queueLoadSequence) return;
   const lastPage = Math.max(1, Math.ceil(result.total / state.pageSize));
-  if (result.total > 0 && state.page > lastPage) {
+  const scanComplete = result.scan_complete !== false;
+  if (result.total > 0 && state.page > lastPage && (scanComplete || !result.items.length)) {
     state.page = lastPage;
     return loadQueue(selectFirst);
   }
@@ -208,6 +210,7 @@ async function loadQueue(selectFirst = false) {
   renderModelOptions(config.model_refresh);
   state.list = result.items;
   state.total = result.total;
+  state.scanComplete = scanComplete;
   state.counts = result.counts;
   renderQueue(result.counts);
   renderBatchControls();
@@ -229,9 +232,9 @@ function renderQueue(counts) {
     elements.queue.append(button);
   }
   const pages = Math.max(1, Math.ceil(state.total / state.pageSize));
-  elements.pageText.textContent = `${state.page} / ${pages}`;
+  elements.pageText.textContent = state.scanComplete ? `${state.page} / ${pages}` : `${state.page} / ${pages}+`;
   elements.previousPage.disabled = state.page <= 1;
-  elements.nextPage.disabled = state.page >= pages;
+  elements.nextPage.disabled = state.page >= pages && state.scanComplete;
   updateItemProgress();
   const batch = activeReviewBatch();
   const batchState = batch ? `${batch.ready_count || 0} ready / ${batch.blocked_count || 0} blocked in batch` : "No active batch";
@@ -283,8 +286,11 @@ function decisionActionAvailable(id) {
 function updateItemProgress() {
   const index = state.current ? state.list.findIndex((item) => item.id === state.current.id) : -1;
   const position = index >= 0 ? ((state.page - 1) * state.pageSize) + index + 1 : 0;
-  elements.itemProgress.textContent = `${position} / ${state.total}`;
-  elements.itemProgress.title = `${position} of ${state.total} items in the current queue`;
+  const totalText = state.scanComplete ? String(state.total) : `${state.total}+`;
+  elements.itemProgress.textContent = `${position} / ${totalText}`;
+  elements.itemProgress.title = state.scanComplete
+    ? `${position} of ${state.total} items in the current queue`
+    : `${position} of at least ${state.total} items; more images remain in the input directory`;
 }
 
 function renderBatchControls() {
@@ -904,11 +910,13 @@ async function moveItem(offset) {
     return;
   }
   const pages = Math.max(1, Math.ceil(state.total / state.pageSize));
-  if (offset > 0 && state.page < pages) {
+  if (offset > 0 && (state.page < pages || !state.scanComplete)) {
     if (state.dirty) await persistCurrent(state.current.status);
+    const previousPage = state.page;
     state.page += 1;
     await loadQueue(false);
-    if (state.list.length) await selectItem(state.list[0].id);
+    if (state.page > previousPage && state.list.length) await selectItem(state.list[0].id);
+    else showEndOfQueue(false);
   } else if (offset < 0 && state.page > 1) {
     if (state.dirty) await persistCurrent(state.current.status);
     state.page -= 1;

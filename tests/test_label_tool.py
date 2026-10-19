@@ -86,6 +86,36 @@ class LabelToolTest(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_pending_pagination_keeps_loading_unscanned_input_images(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            input_root = root / "input"
+            input_root.mkdir()
+            for index in range(5):
+                self.write_image(input_root / f"card-{index}.jpg", bytes([index]))
+            store = ReviewStore(root / "workspace")
+            try:
+                store.initialize(input_root)
+                first = store.list_items({"status": "pending", "page": 1, "page_size": 2})
+                self.assertFalse(first["scan_complete"])
+                self.assertEqual(len(first["items"]), 2)
+                self.assertEqual(first["total"], 3)
+                self.assertEqual(first["counts"]["pending"], 2)
+
+                second = store.list_items({"status": "pending", "page": 2, "page_size": 2})
+                self.assertFalse(second["scan_complete"])
+                self.assertEqual(len(second["items"]), 2)
+                self.assertEqual(second["total"], 5)
+                self.assertEqual(second["counts"]["pending"], 4)
+
+                third = store.list_items({"status": "pending", "page": 3, "page_size": 2})
+                self.assertTrue(third["scan_complete"])
+                self.assertEqual(len(third["items"]), 1)
+                self.assertEqual(third["total"], 5)
+                self.assertEqual(third["counts"]["pending"], 5)
+            finally:
+                store.close()
+
     def test_follow_up_item_remains_addressable_in_current_input_directory(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

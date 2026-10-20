@@ -2,6 +2,16 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- Reuse the input-directory scan between pending-queue refills so saving does
+  not repeatedly enumerate, sort, and skip previously scanned image paths.
+- Prefetch 100 additional pending images when the browser queue needs filling.
+- Avoid full workspace configuration queries and unchanged class-map writes
+  during individual saves; rejection uses the indexed image hash for cleanup.
+
 ## [1.0.0] - 2026-10-13
 
 ### Added

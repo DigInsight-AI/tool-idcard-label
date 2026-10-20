@@ -99,6 +99,9 @@ class ReviewStore:
         self.connection = sqlite3.connect(str(self.database_path), check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
         self._archive_update_lock = threading.RLock()
+        self._input_scan_lock = threading.RLock()
+        self._input_scan_iterator = None
+        self._input_scan_next = None
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA journal_mode = WAL")
         self._create_schema()
@@ -111,12 +114,14 @@ class ReviewStore:
     def close(self):
         # Pending/follow-up/legacy ignored rows are only the lazily loaded
         # input queue. Rejections remain as a durable content-hash exclusion.
-        with self.connection:
-            self.connection.execute(
-                "DELETE FROM items WHERE archived=0 AND supersedes_archive_batch IS NULL "
-                "AND status IN ('pending','needs_review','ignored')"
-            )
-        self.connection.close()
+        with self._input_scan_lock:
+            self._reset_input_scan()
+            with self.connection:
+                self.connection.execute(
+                    "DELETE FROM items WHERE archived=0 AND supersedes_archive_batch IS NULL "
+                    "AND status IN ('pending','needs_review','ignored')"
+                )
+            self.connection.close()
 
     def _create_schema(self):
         self.connection.executescript(
@@ -341,9 +346,14 @@ class ReviewStore:
             self.set_meta("pose_confirmation_removed", "1")
 
     def initialize(self, input_root, limit=None):
+        with self._input_scan_lock:
+            return self._initialize(input_root, limit)
+
+    def _initialize(self, input_root, limit=None):
         input_root = Path(input_root).expanduser().resolve()
         if not input_root.is_dir():
             raise ValueError("input directory does not exist")
+        self._reset_input_scan()
         now = _now()
         with self.connection:
             # Pending/follow-up/legacy ignored rows are an input-session queue.
@@ -375,7 +385,22 @@ class ReviewStore:
         self.sync_candidates()
         return {"imported": 0, "errors": [], "existing": False}
 
-    def _lazy_import_pending(self, required_count):
+    def _reset_input_scan(self):
+        if self._input_scan_iterator is not None:
+            self._input_scan_iterator.close()
+        self._input_scan_iterator = None
+        self._input_scan_next = None
+
+    def _lazy_import_pending(self, required_count, prefetch=0):
+        with self._input_scan_lock:
+            try:
+                self._fill_pending_queue(required_count, prefetch)
+            except Exception:
+                # A rolled-back batch must be replayed from its committed offset.
+                self._reset_input_scan()
+                raise
+
+    def _fill_pending_queue(self, required_count, prefetch):
         """Fill the pending queue without walking the whole input directory."""
         if self.meta("image_scan_complete") == "1":
             return
@@ -387,6 +412,7 @@ class ReviewStore:
         ).fetchone()["count"]
         if existing >= required_count:
             return
+        target_count = required_count + prefetch
         start_offset = int(self.meta("image_scan_offset") or 0)
         limit_text = self.meta("input_limit") or ""
         source_limit = int(limit_text) if limit_text.isdigit() else None
@@ -394,14 +420,26 @@ class ReviewStore:
         now = _now()
         last_offset = start_offset
         reached_end = True
-        image_iter = enumerate(self._input_images(Path(input_root)), 1)
-        with self.connection:
-            for offset, image_path in image_iter:
-                if offset <= start_offset:
-                    continue
-                last_offset = offset
-                if source_limit and offset > source_limit:
+        if self._input_scan_iterator is None:
+            self._input_scan_iterator = self._input_images(Path(input_root))
+            self._input_scan_next = None
+            # Only reopening a store needs to replay its persisted offset.
+            for _ in range(start_offset):
+                if next(self._input_scan_iterator, None) is None:
                     break
+        with self.connection:
+            while True:
+                if source_limit and last_offset >= source_limit:
+                    break
+                if self._input_scan_next is not None:
+                    image_path = self._input_scan_next
+                    self._input_scan_next = None
+                else:
+                    image_path = next(self._input_scan_iterator, None)
+                if image_path is None:
+                    break
+                offset = last_offset + 1
+                last_offset = offset
                 try:
                     image_md5 = compute_image_md5(image_path)
                     width, height = image_dimensions(image_path)
@@ -434,17 +472,16 @@ class ReviewStore:
                 if not cursor.rowcount:
                     continue
                 existing += 1
-                if existing >= required_count:
-                    try:
-                        next(image_iter)
-                    except StopIteration:
-                        reached_end = True
-                    else:
-                        reached_end = False
+                if existing >= target_count:
+                    if not source_limit or offset < source_limit:
+                        self._input_scan_next = next(self._input_scan_iterator, None)
+                        reached_end = self._input_scan_next is None
                     break
             self.set_meta("image_scan_offset", str(last_offset))
             self.set_meta("image_scan_complete", "1" if reached_end else "0")
             self.set_meta("import_errors", json.dumps(errors, separators=(",", ":")))
+        if reached_end:
+            self._reset_input_scan()
 
     def _input_images(self, input_root):
         for root, directories, files in os.walk(input_root):
@@ -1201,7 +1238,8 @@ class ReviewStore:
         if (filters.get("status") or "pending") == "pending":
             page = max(1, int(filters.get("page") or 1))
             page_size = max(1, min(200, int(filters.get("page_size") or 50)))
-            self._lazy_import_pending(page * page_size)
+            prefetch = max(0, min(200, int(filters.get("prefetch") or 0)))
+            self._lazy_import_pending(page * page_size, prefetch)
         clauses = []
         values = []
         status = filters.get("status")
@@ -1743,21 +1781,24 @@ class ReviewStore:
         (root / "images").mkdir(parents=True, exist_ok=True)
         (root / "labels").mkdir(parents=True, exist_ok=True)
         (root / "records").mkdir(parents=True, exist_ok=True)
-        classes = self.config()["classes"]
-        _atomic_write_text(root / "classes.txt", "\n".join(value["name"] for value in classes) + "\n")
+        classes = json.loads(self.meta("classes") or "[]")
+        content = "\n".join(value["name"] for value in classes) + "\n"
+        classes_path = root / "classes.txt"
+        if not classes_path.is_file() or classes_path.read_text(encoding="utf-8") != content:
+            _atomic_write_text(classes_path, content)
         return root
 
     def _sync_candidate_item(self, item):
         if not item:
             return
-        image_md5 = compute_image_md5(item["image_path"])
         if (
             item["status"] != "accepted"
             or item.get("archived")
             or not item.get("pose_ready")
         ):
-            self._remove_candidate_files(image_md5)
+            self._remove_candidate_files(item["image_md5"])
             return
+        image_md5 = compute_image_md5(item["image_path"])
         source_path = Path(item["image_path"])
         if not source_path.is_file():
             raise OSError("accepted source image is missing: %s" % source_path)
@@ -2064,7 +2105,10 @@ class ReviewStore:
             y = max(0.0, min(float(item["height"]), float(point[1])))
             points.append([round(x, 3), round(y, 3)])
         class_id = int(value["class_id"])
-        classes = {entry["id"]: entry["name"] for entry in self.config()["classes"]}
+        classes = {
+            entry["id"]: entry["name"]
+            for entry in json.loads(self.meta("classes") or "[]")
+        }
         if class_id not in classes:
             raise ValueError("unknown class id %d" % class_id)
         score = value.get("score")

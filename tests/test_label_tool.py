@@ -116,6 +116,185 @@ class LabelToolTest(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_pending_refills_reuse_scan_and_preserve_lookahead(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "input"
+            source.mkdir()
+            for index in range(7):
+                self.write_image(source / ("card-%d.png" % index), bytes([index]))
+            store = ReviewStore(root / "workspace")
+            try:
+                store.initialize(source)
+                seen = []
+                with patch.object(store, "_input_images", wraps=store._input_images) as scan:
+                    for page in range(1, 5):
+                        result = store.list_items({"status": "pending", "page": page, "page_size": 2})
+                        seen.extend(item["file_name"] for item in result["items"])
+                    self.assertEqual(scan.call_count, 1)
+                self.assertEqual(seen, ["card-%d.png" % index for index in range(7)])
+                self.assertTrue(result["scan_complete"])
+                self.assertIsNone(store._input_scan_iterator)
+            finally:
+                store.close()
+
+    def test_pending_prefetch_refills_in_batches_after_saves(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "input"
+            source.mkdir()
+            for index in range(12):
+                self.write_image(source / ("card-%02d.png" % index), bytes([index]))
+            store = ReviewStore(root / "workspace")
+            try:
+                store.initialize(source)
+                filters = {"status": "pending", "page_size": 2, "prefetch": 3}
+                first = store.list_items(filters)
+                self.assertEqual(first["counts"]["pending"], 5)
+                for _ in range(3):
+                    item = store.get_item(store.list_items(filters)["items"][0]["id"])
+                    store.update_item(item["id"], {
+                        "version": item["version"], "status": "accepted",
+                        "reviewed": False, "annotations": self.annotations(),
+                    })
+                    with patch.object(store, "_input_images", side_effect=AssertionError("scan restarted")):
+                        queue = store.list_items(filters)
+                    self.assertEqual(int(store.meta("image_scan_offset")), 5)
+                self.assertEqual(queue["counts"]["pending"], 2)
+                item = store.get_item(queue["items"][0]["id"])
+                store.update_item(item["id"], {
+                    "version": item["version"], "status": "accepted",
+                    "reviewed": False, "annotations": self.annotations(),
+                })
+                refill = store.list_items(filters)
+                self.assertEqual(refill["counts"]["pending"], 5)
+                self.assertEqual(int(store.meta("image_scan_offset")), 9)
+            finally:
+                store.close()
+
+    def test_pending_scan_restarts_after_rollback_without_losing_images(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "input"
+            source.mkdir()
+            for index in range(5):
+                self.write_image(source / ("card-%d.png" % index), bytes([index]))
+            store = ReviewStore(root / "workspace")
+            try:
+                store.initialize(source)
+                store.list_items({"status": "pending", "page_size": 1})
+                with patch("idcard_label.store.image_dimensions", side_effect=[(100, 80), RuntimeError("interrupted")]):
+                    with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                        store.list_items({"status": "pending", "page_size": 5})
+                self.assertEqual(store.meta("image_scan_offset"), "1")
+                self.assertIsNone(store._input_scan_iterator)
+                result = store.list_items({"status": "pending", "page_size": 5})
+                self.assertEqual([item["file_name"] for item in result["items"]],
+                                 ["card-%d.png" % index for index in range(5)])
+                self.assertTrue(result["scan_complete"])
+            finally:
+                store.close()
+
+    def test_switching_input_and_closing_release_active_scans(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first = root / "first"
+            second = root / "second"
+            first.mkdir()
+            second.mkdir()
+            for index in range(3):
+                self.write_image(first / ("first-%d.png" % index), bytes([index]))
+                self.write_image(second / ("second-%d.png" % index), bytes([index + 3]))
+            store = ReviewStore(root / "workspace")
+            try:
+                store.initialize(first)
+                store.list_items({"status": "pending", "page_size": 1})
+                first_scan = store._input_scan_iterator
+                self.assertIsNotNone(first_scan.gi_frame)
+                store.initialize(second)
+                self.assertIsNone(first_scan.gi_frame)
+                queue = store.list_items({"status": "pending", "page_size": 1})
+                self.assertEqual(queue["items"][0]["file_name"], "second-0.png")
+                second_scan = store._input_scan_iterator
+                self.assertIsNotNone(second_scan.gi_frame)
+            finally:
+                store.close()
+            self.assertIsNone(second_scan.gi_frame)
+
+    def test_pending_prefetch_respects_input_limit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for index in range(5):
+                self.write_image(root / ("card-%d.png" % index), bytes([index]))
+            store = ReviewStore(root / "workspace")
+            try:
+                store.initialize(root, limit=3)
+                result = store.list_items({"status": "pending", "page_size": 2, "prefetch": 100})
+                self.assertEqual(result["counts"]["pending"], 3)
+                self.assertEqual(store.meta("image_scan_offset"), "3")
+                self.assertTrue(result["scan_complete"])
+                self.assertIsNone(store._input_scan_iterator)
+            finally:
+                store.close()
+
+    def test_concurrent_pending_refills_share_one_scan(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for index in range(10):
+                self.write_image(root / ("card-%d.png" % index), bytes([index]))
+            store = ReviewStore(root / "workspace")
+            try:
+                store.initialize(root)
+                barrier = threading.Barrier(2)
+                errors = []
+
+                def fill():
+                    try:
+                        barrier.wait(timeout=5)
+                        store._lazy_import_pending(5)
+                    except Exception as error:
+                        errors.append(error)
+
+                with patch.object(store, "_input_images", wraps=store._input_images) as scan:
+                    workers = [threading.Thread(target=fill) for _ in range(2)]
+                    for worker in workers:
+                        worker.start()
+                    for worker in workers:
+                        worker.join(5)
+                    self.assertFalse(any(worker.is_alive() for worker in workers))
+                    self.assertEqual(errors, [])
+                    self.assertEqual(scan.call_count, 1)
+                self.assertEqual(store.meta("image_scan_offset"), "5")
+                self.assertEqual(store.status_counts()["pending"], 5)
+            finally:
+                store.close()
+
+    def test_saves_skip_full_config_and_unchanged_classes_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.write_image(root / "card.png")
+            store = ReviewStore(root / "workspace")
+            try:
+                store.initialize(root)
+                item = store.get_item(store.list_items({"status": "pending"})["items"][0]["id"])
+                with patch.object(store, "config", side_effect=AssertionError("full config queried")), \
+                     patch("idcard_label.store._atomic_write_text", wraps=_atomic_write_text) as write:
+                    store.update_item(item["id"], {
+                        "version": item["version"], "status": "accepted",
+                        "reviewed": False, "annotations": self.annotations(),
+                    })
+                self.assertEqual({call.args[0].suffix for call in write.call_args_list}, {".txt", ".json"})
+                self.assertEqual(write.call_count, 2)
+                item = store.get_item(item["id"])
+                with patch("idcard_label.store.compute_image_md5", side_effect=AssertionError("image reread")):
+                    store.update_item(item["id"], {
+                        "version": item["version"], "status": "rejected",
+                        "reviewed": True, "annotations": [],
+                    })
+                self.assertEqual(list((root / "workspace/candidates/records").iterdir()), [])
+            finally:
+                store.close()
+
     def test_follow_up_item_remains_addressable_in_current_input_directory(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

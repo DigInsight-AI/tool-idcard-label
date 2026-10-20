@@ -194,6 +194,7 @@ async function loadQueue(selectFirst = false) {
     archive_batch: archiveBatch,
     page: state.page,
     page_size: state.pageSize,
+    prefetch: elements.statusFilter.value === "pending" ? 100 : 0,
   });
   const [result, config] = await Promise.all([
     request(`/api/items?${params}`),

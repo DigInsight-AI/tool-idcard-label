@@ -276,7 +276,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
             return self._json(item)
         match = IMAGE_PATTERN.match(parsed.path)
         if match:
-            return self._image(int(match.group(1)))
+            query = parse_qs(parsed.query)
+            return self._image(int(match.group(1)), query.get("image_md5", [None])[-1])
         return self._static(parsed.path)
 
     def do_PUT(self):
@@ -372,12 +373,21 @@ class ReviewHandler(BaseHTTPRequestHandler):
         if match:
             if not self.server.model_refresher:
                 return self._error(HTTPStatus.SERVICE_UNAVAILABLE, "model refresh is not configured")
-            item = self.server.store.get_item(int(match.group(1)))
+            store = self.server.store
+            item = store.get_item(int(match.group(1)))
             if not item:
                 return self._error(HTTPStatus.NOT_FOUND, "item not found")
             try:
-                result = self.server.model_refresher.refresh(item, self.server.store.config()["classes"])
+                payload = self._read_json()
+                if payload.get("image_md5") != item["image_md5"]:
+                    return self._error(HTTPStatus.CONFLICT, "image changed; reload the current item")
+                result = self.server.model_refresher.refresh(item, store.config()["classes"])
+                if self.server.store is not store:
+                    return self._error(HTTPStatus.CONFLICT, "workspace changed; reload the current item")
+                result["image_md5"] = item["image_md5"]
                 return self._json(result, HTTPStatus.OK)
+            except (ValueError, TypeError, json.JSONDecodeError) as error:
+                return self._error(HTTPStatus.BAD_REQUEST, str(error))
             except ModelRefreshError as error:
                 return self._error(HTTPStatus.BAD_GATEWAY, str(error))
         if parsed.path == "/api/archive":
@@ -422,10 +432,13 @@ class ReviewHandler(BaseHTTPRequestHandler):
     def _workspace_not_open(self):
         return self._error(HTTPStatus.PRECONDITION_REQUIRED, "choose valid directories first")
 
-    def _image(self, item_id):
+    def _image(self, item_id, image_md5=None):
         if not self.server.store:
             return self._workspace_not_open()
-        path = self.server.store.image_path(item_id)
+        item = self.server.store.get_item(item_id)
+        if image_md5 is not None and item and image_md5 != item["image_md5"]:
+            return self._error(HTTPStatus.CONFLICT, "image changed; reload the current item")
+        path = item["image_path"] if item else None
         if not path or not os.path.isfile(path):
             return self._error(HTTPStatus.NOT_FOUND, "image not found")
         content_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
@@ -433,7 +446,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(size))
-        self.send_header("Cache-Control", "private, max-age=3600")
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         with open(path, "rb") as handle:
             while True:

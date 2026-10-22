@@ -8,7 +8,7 @@ from contextlib import redirect_stdout
 from http.server import BaseHTTPRequestHandler
 from io import StringIO
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -1181,6 +1181,82 @@ class LabelToolTest(unittest.TestCase):
             finally:
                 restored.server_close()
                 restored.close_store()
+
+    def test_reused_item_ids_cannot_mix_images_or_model_results(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            first, second = root / "first", root / "second"
+            first.mkdir()
+            second.mkdir()
+            self.write_image(first / "old.png", b"old image")
+            self.write_image(second / "new.png", b"new image")
+            refresher = Mock()
+            refresher.describe.return_value = {}
+            refresher.refresh.return_value = {"annotations": self.annotations(), "detections": 1}
+            server = ReviewServer(
+                ("127.0.0.1", 0), model_refresher=refresher,
+                preferences_path=root / "preferences.json",
+            )
+            server.open_workspace(first, root / "workspace", confirm_create=True)
+            thread = threading.Thread(target=server.serve_forever)
+            thread.start()
+            base = "http://127.0.0.1:%d" % server.server_address[1]
+
+            def current_item():
+                entry = server.store.list_items({"status": "pending"})["items"][0]
+                return server.store.get_item(entry["id"])
+
+            def refresh(item):
+                return urlopen(Request(
+                    base + "/api/items/%d/refresh" % item["id"],
+                    data=json.dumps({"image_md5": item["image_md5"]}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"}, method="POST",
+                ))
+
+            try:
+                old = current_item()
+                old_url = base + "/api/images/%d?image_md5=%s&v=%d" % (
+                    old["id"], old["image_md5"], old["version"],
+                )
+                with urlopen(old_url) as response:
+                    self.assertEqual(response.headers["Cache-Control"], "no-store")
+                    self.assertEqual(response.read(), (first / "old.png").read_bytes())
+
+                server.open_workspace(second, root / "workspace")
+                new = current_item()
+                self.assertEqual(old["id"], new["id"])
+                self.assertEqual(old["version"], new["version"])
+                self.assertNotEqual(old["image_md5"], new["image_md5"])
+                with self.assertRaises(HTTPError) as raised:
+                    urlopen(old_url)
+                self.assertEqual(raised.exception.code, 409)
+                with urlopen(base + "/api/images/%d?image_md5=%s" % (new["id"], new["image_md5"])) as response:
+                    self.assertEqual(response.read(), (second / "new.png").read_bytes())
+                with urlopen(base + "/api/images/%d?v=1" % new["id"]) as response:
+                    self.assertEqual(response.headers["Cache-Control"], "no-store")
+
+                with self.assertRaises(HTTPError) as raised:
+                    refresh(old)
+                self.assertEqual(raised.exception.code, 409)
+                refresher.refresh.assert_not_called()
+                with refresh(new) as response:
+                    result = json.loads(response.read())
+                self.assertEqual(result["image_md5"], new["image_md5"])
+                self.assertEqual(refresher.refresh.call_args[0][0]["image_path"], new["image_path"])
+
+                def switch_during_refresh(*args):
+                    server.open_workspace(first, root / "workspace")
+                    return {"annotations": self.annotations(), "detections": 1}
+
+                refresher.refresh.side_effect = switch_during_refresh
+                with self.assertRaises(HTTPError) as raised:
+                    refresh(new)
+                self.assertEqual(raised.exception.code, 409)
+            finally:
+                server.shutdown()
+                thread.join()
+                server.server_close()
+                server.close_store()
 
     def test_model_directory_and_selected_model_are_persisted(self):
         with tempfile.TemporaryDirectory() as temporary:

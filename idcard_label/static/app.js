@@ -11,6 +11,7 @@ const state = {
   selectedAnnotations: new Set(),
   undoStack: [],
   image: null,
+  imageMd5: null,
   transform: null,
   dragPoint: null,
   dirty: false,
@@ -525,7 +526,7 @@ async function selectItem(id) {
     state.undoStack = [];
     state.correctionNoticeShown = false;
     elements.undoButton.disabled = true;
-    elements.modelRefreshButton.disabled = false;
+    elements.modelRefreshButton.disabled = true;
     state.dirty = false;
     elements.fileName.textContent = item.file_name;
     elements.fileName.title = item.image_path;
@@ -534,7 +535,11 @@ async function selectItem(id) {
     updateReviewControls();
     elements.emptyState.hidden = true;
     renderTargets();
-    await loadImage(item.id);
+    state.image = null;
+    state.imageMd5 = null;
+    resizeCanvas();
+    await loadImage(item);
+    elements.modelRefreshButton.disabled = state.imageMd5 !== state.current?.image_md5;
     renderQueue(state.counts || { accepted: 0, pending: 0, needs_review: 0, rejected: 0 });
   } catch (error) {
     showToast(error.message, true);
@@ -543,16 +548,21 @@ async function selectItem(id) {
   }
 }
 
-function loadImage(id) {
+function loadImage(item) {
   return new Promise((resolve, reject) => {
     const image = new Image();
     image.onload = () => {
+      if (state.current !== item) {
+        resolve();
+        return;
+      }
       state.image = image;
+      state.imageMd5 = item.image_md5;
       resizeCanvas();
       resolve();
     };
     image.onerror = () => reject(new Error("Could not decode the source image"));
-    image.src = `/api/images/${id}?v=${state.current.version}`;
+    image.src = `/api/images/${item.id}?image_md5=${encodeURIComponent(item.image_md5)}&v=${item.version}`;
   });
 }
 
@@ -1106,14 +1116,18 @@ async function toggleReviewed() {
 }
 
 async function refreshWithModel() {
-  if (!state.current || elements.modelRefreshButton.disabled) return;
+  if (!state.current || elements.modelRefreshButton.disabled || state.imageMd5 !== state.current.image_md5) return;
   const itemId = state.current.id;
+  const imageMd5 = state.current.image_md5;
   elements.modelRefreshButton.disabled = true;
   const originalText = elements.modelRefreshButton.textContent;
   elements.modelRefreshButton.textContent = "...";
   try {
-    const result = await request(`/api/items/${itemId}/refresh`, { method: "POST", body: "{}" });
-    if (state.current?.id !== itemId) return;
+    const result = await request(`/api/items/${itemId}/refresh`, {
+      method: "POST", body: JSON.stringify({ image_md5: imageMd5 }),
+    });
+    if (state.current?.id !== itemId || state.current.image_md5 !== imageMd5 || state.imageMd5 !== imageMd5) return;
+    if (result.image_md5 !== imageMd5) throw new Error("Image changed; reload the current item");
     pushUndo();
     state.current.annotations = result.annotations;
     state.activeAnnotation = 0;
@@ -1126,7 +1140,7 @@ async function refreshWithModel() {
     showToast(error.message, true);
   } finally {
     elements.modelRefreshButton.textContent = originalText;
-    elements.modelRefreshButton.disabled = false;
+    elements.modelRefreshButton.disabled = !state.current || state.imageMd5 !== state.current.image_md5;
   }
 }
 
@@ -1362,6 +1376,7 @@ function positionCanvasEditor() {
 function clearCurrent() {
   state.current = null;
   state.image = null;
+  state.imageMd5 = null;
   state.dirty = false;
   state.selectedAnnotations = new Set();
   state.undoStack = [];
